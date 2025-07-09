@@ -7,6 +7,18 @@
 
 // -*- c++ -*-
 
+// IndexFlat
+// ├─ 核心功能
+// │  ├─ search: 多度量暴力搜索
+// │  ├─ range_search: 范围过滤
+// │  └─ compute_distance_subset: 子集距离计算
+// ├─ 距离策略
+// │  ├─ FlatL2Dis/IPDis: 基础实现
+// │  └─ FlatL2WithNormsDis: 缓存优化
+// └─ 一维特化
+//    ├─ 排序维护 (perm)
+//    └─ 二分查找+扩展
+
 #include <faiss/IndexFlat.h>
 
 #include <faiss/impl/AuxIndexStructures.h>

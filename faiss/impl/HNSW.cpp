@@ -31,11 +31,13 @@ namespace faiss {
  * HNSW structure implementation
  **************************************************************/
 
+// 返回指定层级的邻居数目。
 int HNSW::nb_neighbors(int layer_no) const {
     return cum_nneighbor_per_level[layer_no + 1] -
             cum_nneighbor_per_level[layer_no];
 }
 
+// 设置指定层级的邻居数目，并调整累积邻居数目数组。
 void HNSW::set_nb_neighbors(int level_no, int n) {
     FAISS_THROW_IF_NOT(levels.size() == 0);
     int cur_n = nb_neighbors(level_no);
@@ -44,10 +46,12 @@ void HNSW::set_nb_neighbors(int level_no, int n) {
     }
 }
 
+// 返回到指定层级为止的累积邻居数目。
 int HNSW::cum_nb_neighbors(int layer_no) const {
     return cum_nneighbor_per_level[layer_no];
 }
 
+// 计算节点no在指定层级layer_no的邻居范围，即邻接表中该节点邻居的起始和结束索引。
 void HNSW::neighbor_range(idx_t no, int layer_no, size_t* begin, size_t* end)
         const {
     size_t o = offsets[no];
@@ -55,11 +59,14 @@ void HNSW::neighbor_range(idx_t no, int layer_no, size_t* begin, size_t* end)
     *end = o + cum_nb_neighbors(layer_no + 1);
 }
 
+
+// 初始化随机数生成器和默认概率分布。
 HNSW::HNSW(int M) : rng(12345) {
-    set_default_probas(M, 1.0 / log(M));
+    set_default_probas(M, 1.0 / log(M)); // 设置默认的概率分布和累积邻居数目。
     offsets.push_back(0);
 }
 
+// 随机选择一个层级，用于将新节点分配到相应的层级。
 int HNSW::random_level() {
     double f = rng.rand_float();
     // could be a bit faster with bissection
@@ -73,6 +80,7 @@ int HNSW::random_level() {
     return assign_probas.size() - 1;
 }
 
+// 设置默认的层级概率分布，并计算累积邻居数目。
 void HNSW::set_default_probas(int M, float levelMult) {
     int nn = 0;
     cum_nneighbor_per_level.push_back(0);
@@ -86,6 +94,7 @@ void HNSW::set_default_probas(int M, float levelMult) {
     }
 }
 
+// 清空指定层级（level）所有节点的邻居列表。
 void HNSW::clear_neighbor_tables(int level) {
     for (int i = 0; i < levels.size(); i++) {
         size_t begin, end;
@@ -96,6 +105,7 @@ void HNSW::clear_neighbor_tables(int level) {
     }
 }
 
+// 重置整个HNSW结构到初始状态。
 void HNSW::reset() {
     max_level = -1;
     entry_point = -1;
@@ -105,6 +115,7 @@ void HNSW::reset() {
     neighbors.clear();
 }
 
+// 打印指定层级（level）的邻居统计信息。
 void HNSW::print_neighbor_stats(int level) const {
     FAISS_THROW_IF_NOT(level < cum_nneighbor_per_level.size());
     printf("stats on level %d, max %d neighbors per vertex:\n",
@@ -165,6 +176,7 @@ void HNSW::print_neighbor_stats(int level) const {
            tot_common);
 }
 
+// 为HNSW图中的 n 个节点填充随机邻居链接，从最高层级到最低层级（level 0），为每个节点的邻居表分配随机连接。
 void HNSW::fill_with_random_links(size_t n) {
     int max_level_2 = prepare_level_tab(n);
     RandomGenerator rng2(456);
@@ -197,6 +209,7 @@ void HNSW::fill_with_random_links(size_t n) {
     }
 }
 
+// 这个函数为 n 个新节点准备层级表，分配每个节点的层级并更新偏移和邻居存储空间，返回最大层级。
 int HNSW::prepare_level_tab(size_t n, bool preset_levels) {
     size_t n0 = offsets.size() - 1;
 
@@ -226,6 +239,9 @@ int HNSW::prepare_level_tab(size_t n, bool preset_levels) {
  * neighbor only if there is no previous neighbor that is closer to
  * that vertex than the query.
  */
+// 从输入的候选邻居列表（input，一个优先队列）中选择一部分节点，修剪后存储到 output（一个向量），确保
+// 1. 保留的邻居数量不超过 max_size。
+// 2. 只保留那些没有更近邻居（相对于查询点）的节点。
 void HNSW::shrink_neighbor_list(
         DistanceComputer& qdis,
         std::priority_queue<NodeDistFarther>& input,
@@ -306,6 +322,7 @@ void shrink_neighbor_list(
 
 /// add a link between two elements, possibly shrinking the list
 /// of links to make room for it.
+// 在HNSW图中，将源节点 src 和目标节点 dest 在指定层级 level 上建立链接。如果 src 的邻居列表已满，则通过修剪现有邻居列表为新链接腾出空间。
 void add_link(
         HNSW& hnsw,
         DistanceComputer& qdis,
@@ -354,6 +371,7 @@ void add_link(
 } // namespace
 
 /// search neighbors on a single level, starting from an entry point
+// 在 HNSW 图的指定层级（level）上，从给定的入口节点（entry_point）开始，找到与查询点最近的邻居节点，并将结果存储在 results 中。
 void search_neighbors_to_add(
         HNSW& hnsw,
         DistanceComputer& qdis,
@@ -479,6 +497,7 @@ void search_neighbors_to_add(
 
 /// Finds neighbors and builds links with them, starting from an entry
 /// point. The own neighbor list is assumed to be locked.
+// 为新插入的节点 pt_id 在指定的层级 level 上找到一组合适的邻居，并与这些邻居建立链接。
 void HNSW::add_links_starting_from(
         DistanceComputer& ptdis,
         storage_idx_t pt_id,
@@ -576,6 +595,8 @@ void HNSW::add_with_locks(
 /**************************************************************
  * Searching
  **************************************************************/
+
+// 从给定的候选节点列表开始，在 HNSW 图的指定层级上执行搜索，找到与查询点最近的邻居，并将结果存储到结果处理器中。这个函数通常在 HNSW 的多层搜索过程中使用，从高层逐步向下层细化，最终在第 0 层得到精确的最近邻结果。
 
 using MinimaxHeap = HNSW::MinimaxHeap;
 using Node = HNSW::Node;
@@ -719,6 +740,7 @@ int search_from_candidates(
     return nres;
 }
 
+// 从一个给定的候选节点出发，在 HNSW 图的第 0 层上进行搜索，逐步扩展到邻居节点，最终返回与查询点最近的邻居集合。这个函数通常用于 HNSW 搜索的最后阶段，从高层搜索得到的入口点开始，在最底层细化结果。
 std::priority_queue<HNSW::Node> search_from_candidate_unbounded(
         const HNSW& hnsw,
         const Node& node,
@@ -826,6 +848,7 @@ std::priority_queue<HNSW::Node> search_from_candidate_unbounded(
 }
 
 /// greedily update a nearest vector at a given level
+// 在 HNSW 图的某个层级上，从当前最近节点出发，检查其邻居，尝试找到比当前节点更接近查询点的节点，并更新最近节点和对应的距离。这个过程会持续进行，直到无法找到更近的节点为止。
 HNSWStats greedy_update_nearest(
         const HNSW& hnsw,
         DistanceComputer& qdis,
@@ -906,6 +929,7 @@ using Node = HNSW::Node;
 using C = HNSW::C;
 
 // just used as a lower bound for the minmaxheap, but it is set for heap search
+// 从 ResultHandler<C> 对象中提取参数 k（通常表示最近邻搜索的目标数量），如果提取失败，则返回默认值 1。
 int extract_k_from_ResultHandler(ResultHandler<C>& res) {
     using RH = HeapBlockResultHandler<C>;
     if (auto hres = dynamic_cast<RH::SingleResultHandler*>(&res)) {

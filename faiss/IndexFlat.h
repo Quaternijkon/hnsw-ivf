@@ -7,6 +7,17 @@
 
 // -*- c++ -*-
 
+// IndexFlatCodes (Base)
+// │
+// ├─ IndexFlat
+// │  ├─ IndexFlatIP (Inner Product)
+// │  └─ IndexFlatL2 (L2 with norm cache)
+// │     └─ IndexFlat1D (1D optimized)
+// │
+// ├─ 数据存储: codes (uint8_t*)
+// ├─ 方法: search, range_search, reconstruct, compute_distance_subset
+// └─ 优化: L2 范数缓存、一维排序
+
 #ifndef INDEX_FLAT_H
 #define INDEX_FLAT_H
 

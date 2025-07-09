@@ -14,7 +14,7 @@ from faiss.contrib import datasets
 from faiss.contrib.exhaustive_search import knn_ground_truth
 from faiss.contrib import vecs_io
 
-ds = datasets.DatasetDeep1B(nb=int(1e9))
+ds = datasets.DatasetDeep1B(nb=int(1e6))
 
 print("computing GT matches for", ds)
 
@@ -24,4 +24,4 @@ D, I = knn_ground_truth(
     k=100
 )
 
-vecs_io.ivecs_write("/tmp/tt.ivecs", I)
+vecs_io.ivecs_write("../data/sift1M/sift_groundtruth.ivecs", I)
