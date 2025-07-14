@@ -5,6 +5,7 @@ import os
 import platform
 import resource
 import struct
+import re
 
 # ==============================================================================
 # 0. 路径和文件名配置
@@ -14,8 +15,6 @@ LEARN_FILE = os.path.join(DATA_DIR, "sift_learn.fbin")
 BASE_FILE = os.path.join(DATA_DIR, "sift_base.fbin")
 QUERY_FILE = os.path.join(DATA_DIR, "sift_query.fbin")
 GROUNDTRUTH_FILE = os.path.join(DATA_DIR, "sift_groundtruth.ivecs") # 新增Groundtruth文件路径
-INDEX_FILE = "large_ivf_hnsw_on_disk.index"
-
 
 # ==============================================================================
 # 1. 辅助函数：读取.fbin文件
@@ -75,9 +74,11 @@ nlist = nb // cell_size
 chunk_size = 100000  # 每次处理的数据块大小
 k = 10  # 查找最近的10个邻居
 
-# 确保旧文件被清理
-if os.path.exists(INDEX_FILE):
-    os.remove(INDEX_FILE)
+# 生成基于参数的索引文件名
+base_name = os.path.splitext(os.path.basename(BASE_FILE))[0]
+# 清理文件名中的特殊字符
+clean_base_name = re.sub(r'[^a-zA-Z0-9_]', '_', base_name)
+INDEX_FILE = os.path.join(DATA_DIR, f"{clean_base_name}_d{d_train}_nlist{nlist}_HNSW32_IVFFlat.index")
 
 print("="*60)
 print("Phase 0: 环境设置")
@@ -88,112 +89,123 @@ print(f"索引将保存在磁盘文件: {INDEX_FILE}")
 print("="*60)
 
 # ==============================================================================
-# 3. 训练量化器 (使用learn.fbin的前ntrain个向量)
+# 3. 检查索引文件是否存在
 # ==============================================================================
-print("\nPhase 1: 训练 HNSW 粗量化器 (in-memory)")
-coarse_quantizer = faiss.IndexHNSWFlat(d_train, 32, faiss.METRIC_L2)
-index_for_training = faiss.IndexIVFFlat(coarse_quantizer, d_train, nlist, faiss.METRIC_L2)
-index_for_training.verbose = True
-
-xt = read_fbin(LEARN_FILE)
-
-print("训练聚类中心并构建 HNSW 量化器...")
-start_time = time.time()
-index_for_training.train(xt)
-end_time = time.time()
-
-print(f"量化器训练完成，耗时: {end_time - start_time:.2f} 秒")
-print(f"粗量化器中的质心数量: {coarse_quantizer.ntotal}")
-del xt
-del index_for_training
-
-# ==============================================================================
-# 4. 创建一个空的、基于磁盘的索引框架
-# ==============================================================================
-print("\nPhase 2: 创建空的磁盘索引框架")
-index_shell = faiss.IndexIVFFlat(coarse_quantizer, d_train, nlist, faiss.METRIC_L2)
-print("将空的索引框架写入磁盘...")
-faiss.write_index(index_shell, INDEX_FILE)
-del index_shell
-
-# ==============================================================================
-# 5. 分块向磁盘索引中添加数据 (从base.fbin)
-# ==============================================================================
-print("\nPhase 3: 分块添加数据到磁盘索引")
-
-# 兼容不同Faiss版本的IO标志处理
-try:
-    IO_FLAG_READ_WRITE = faiss.IO_FLAG_READ_WRITE
-except AttributeError:
-    try:
-        IO_FLAG_READ_WRITE = faiss.index_io.IO_FLAG_READ_WRITE
-    except AttributeError:
-        IO_FLAG_READ_WRITE = 0
-
-print(f"使用IO标志: {IO_FLAG_READ_WRITE} (读写模式)")
-
-index_ondisk = faiss.read_index(INDEX_FILE, IO_FLAG_READ_WRITE)
-start_time = time.time()
-
-# 保存前5个向量用于Sanity Check
-sanity_vectors = None
-
-num_chunks = (nb + chunk_size - 1) // chunk_size
-for i in range(0, nb, chunk_size):
-    chunk_idx = i // chunk_size + 1
-    print(f"    -> 正在处理块 {chunk_idx}/{num_chunks}: 向量 {i} 到 {min(i+chunk_size, nb)-1}")
-    
-    # 从base.fbin中读取数据块
-    xb_chunk, _, _ = read_fbin(BASE_FILE, i, chunk_size)
-    
-    # 如果是第一个块，保存前5个向量
-    if i == 0 and sanity_vectors is None:
-        sanity_vectors = xb_chunk[:5].copy()
-    
-    index_ondisk.add(xb_chunk)
-    del xb_chunk
-
-print(f"\n所有数据块添加完成，总耗时: {time.time() - start_time:.2f} 秒")
-print(f"磁盘索引中的向量总数 (ntotal): {index_ondisk.ntotal}")
-
-# ===========================================================
-# Sanity Check - 检查索引是否正常工作
-# ===========================================================
-if sanity_vectors is not None:
-    print("\n进行Sanity Check...")
-    print("在索引中搜索前5个向量本身:")
-    D_check, I_check = index_ondisk.search(sanity_vectors, k)
-    
-    print("Sanity Check - 索引结果 (I):")
-    print(I_check)
-    print("Sanity Check - 距离结果 (D):")
-    print(D_check)
-    
-    # 检查结果
-    passed = True
-    for j in range(5):
-        if I_check[j, 0] != j:
-            print(f"警告: 第{j}个向量的最近邻居索引是{I_check[j,0]}而不是{j}")
-            passed = False
-        if not np.isclose(D_check[j, 0], 0.0, atol=1e-5):
-            print(f"警告: 第{j}个向量的最近邻居距离是{D_check[j,0]}而不是0 (允许误差1e-5)")
-    
-    if passed:
-        print("Sanity Check 通过: 所有向量的最近邻居都是自身")
-    else:
-        print("Sanity Check 警告: 某些向量的最近邻居不是自身 (可能是索引配置问题)")
+if os.path.exists(INDEX_FILE):
+    print(f"索引文件 {INDEX_FILE} 已存在，跳过索引构建阶段")
+    skip_index_building = True
 else:
-    print("无法进行Sanity Check: 未保存前5个向量")
-
-print("正在将最终索引写回磁盘...")
-faiss.write_index(index_ondisk, INDEX_FILE)
-del index_ondisk
+    print("索引文件不存在，将构建新索引")
+    skip_index_building = False
 
 # ==============================================================================
-# 6. 使用内存映射 (mmap) 进行搜索 (使用query.fbin)
+# 4. 训练量化器 (使用learn.fbin的前ntrain个向量)
+# ==============================================================================
+if not skip_index_building:
+    print("\nPhase 1: 训练 HNSW 粗量化器 (in-memory)")
+    coarse_quantizer = faiss.IndexHNSWFlat(d_train, 32, faiss.METRIC_L2)
+    index_for_training = faiss.IndexIVFFlat(coarse_quantizer, d_train, nlist, faiss.METRIC_L2)
+    index_for_training.verbose = True
+
+    xt = read_fbin(LEARN_FILE)
+
+    print("训练聚类中心并构建 HNSW 量化器...")
+    start_time = time.time()
+    index_for_training.train(xt)
+    end_time = time.time()
+
+    print(f"量化器训练完成，耗时: {end_time - start_time:.2f} 秒")
+    print(f"粗量化器中的质心数量: {coarse_quantizer.ntotal}")
+    del xt
+    del index_for_training
+
+    # ==============================================================================
+    # 5. 创建一个空的、基于磁盘的索引框架
+    # ==============================================================================
+    print("\nPhase 2: 创建空的磁盘索引框架")
+    index_shell = faiss.IndexIVFFlat(coarse_quantizer, d_train, nlist, faiss.METRIC_L2)
+    print(f"将空的索引框架写入磁盘: {INDEX_FILE}")
+    faiss.write_index(index_shell, INDEX_FILE)
+    del index_shell
+
+    # ==============================================================================
+    # 6. 分块向磁盘索引中添加数据 (从base.fbin)
+    # ==============================================================================
+    print("\nPhase 3: 分块添加数据到磁盘索引")
+
+    # 兼容不同Faiss版本的IO标志处理
+    try:
+        IO_FLAG_READ_WRITE = faiss.IO_FLAG_READ_WRITE
+    except AttributeError:
+        try:
+            IO_FLAG_READ_WRITE = faiss.index_io.IO_FLAG_READ_WRITE
+        except AttributeError:
+            IO_FLAG_READ_WRITE = 0
+
+    print(f"使用IO标志: {IO_FLAG_READ_WRITE} (读写模式)")
+
+    index_ondisk = faiss.read_index(INDEX_FILE, IO_FLAG_READ_WRITE)
+    start_time = time.time()
+
+    # 保存前5个向量用于Sanity Check
+    sanity_vectors = None
+
+    num_chunks = (nb + chunk_size - 1) // chunk_size
+    for i in range(0, nb, chunk_size):
+        chunk_idx = i // chunk_size + 1
+        print(f"    -> 正在处理块 {chunk_idx}/{num_chunks}: 向量 {i} 到 {min(i+chunk_size, nb)-1}")
+        
+        # 从base.fbin中读取数据块
+        xb_chunk, _, _ = read_fbin(BASE_FILE, i, chunk_size)
+        
+        # 如果是第一个块，保存前5个向量
+        if i == 0 and sanity_vectors is None:
+            sanity_vectors = xb_chunk[:5].copy()
+        
+        index_ondisk.add(xb_chunk)
+        del xb_chunk
+
+    print(f"\n所有数据块添加完成，总耗时: {time.time() - start_time:.2f} 秒")
+    print(f"磁盘索引中的向量总数 (ntotal): {index_ondisk.ntotal}")
+
+    # ===========================================================
+    # Sanity Check - 检查索引是否正常工作
+    # ===========================================================
+    if sanity_vectors is not None:
+        print("\n进行Sanity Check...")
+        print("在索引中搜索前5个向量本身:")
+        D_check, I_check = index_ondisk.search(sanity_vectors, k)
+        
+        print("Sanity Check - 索引结果 (I):")
+        print(I_check)
+        print("Sanity Check - 距离结果 (D):")
+        print(D_check)
+        
+        # 检查结果
+        passed = True
+        for j in range(5):
+            if I_check[j, 0] != j:
+                print(f"警告: 第{j}个向量的最近邻居索引是{I_check[j,0]}而不是{j}")
+                passed = False
+            if not np.isclose(D_check[j, 0], 0.0, atol=1e-5):
+                print(f"警告: 第{j}个向量的最近邻居距离是{D_check[j,0]}而不是0 (允许误差1e-5)")
+        
+        if passed:
+            print("Sanity Check 通过: 所有向量的最近邻居都是自身")
+        else:
+            print("Sanity Check 警告: 某些向量的最近邻居不是自身 (可能是索引配置问题)")
+    else:
+        print("无法进行Sanity Check: 未保存前5个向量")
+
+    print(f"正在将最终索引写回磁盘: {INDEX_FILE}")
+    faiss.write_index(index_ondisk, INDEX_FILE)
+    del index_ondisk
+
+# ==============================================================================
+# 7. 使用内存映射 (mmap) 进行搜索 (使用query.fbin)
 # ==============================================================================
 print("\nPhase 4: 使用内存映射模式进行搜索")
-print("以 mmap 模式打开磁盘索引...")
+print(f"以 mmap 模式打开磁盘索引: {INDEX_FILE}")
 
 # 兼容不同Faiss版本的IO标志处理
 try:
@@ -215,7 +227,7 @@ xq = read_fbin(QUERY_FILE)
 
 print("执行搜索...")
 start_time = time.time()
-D, I = index_final.search(xq, k)
+D, I = index_final.search(xq, k) # TODO:不要一次性加载所有查询，也不要在内存中保存全部结果。分块查询，分块输出。
 end_time = time.time()
 print(f"搜索完成，耗时: {end_time - start_time:.2f} 秒")
 
@@ -238,7 +250,7 @@ else:
     print("距离值均为非负，符合预期")
 
 # ==============================================================================
-# 7.  新增: 根据Groundtruth计算召回率 (内存优化版)
+# 8.  新增: 根据Groundtruth计算召回率 (内存优化版)
 # ==============================================================================
 print("\n" + "="*60)
 print("Phase 5: 计算召回率 (内存优化版)")
@@ -303,7 +315,7 @@ print("="*60)
 
 
 # ==============================================================================
-# 8. 报告峰值内存并清理
+# 9. 报告峰值内存并清理
 # ==============================================================================
 print("\n" + "="*60)
 if platform.system() in ["Linux", "Darwin"]:
@@ -316,5 +328,6 @@ else:
     print("当前操作系统非 Linux/macOS，无法自动报告峰值内存。")
 print("="*60)
 
+# 注释掉删除索引文件的代码，以便后续重用
 # print(f"\n清理临时索引文件: {INDEX_FILE}")
 # os.remove(INDEX_FILE)
