@@ -72,7 +72,7 @@ if d_train != d_base or d_train != d_query:
     raise ValueError(f"维度不一致: 训练集{d_train}维, 基础集{d_base}维, 查询集{d_query}维")
 
 # 设置其他参数
-cell_size = 64
+cell_size = 256
 nlist = nb // cell_size
 chunk_size = 100000  # 每次处理的数据块大小
 k = 10  # 查找最近的10个邻居
@@ -272,7 +272,7 @@ except AttributeError:
 print(f"使用IO标志: {IO_FLAG_MMAP} (内存映射模式)")
 
 index_final = faiss.read_index(INDEX_FILE, IO_FLAG_MMAP)
-index_final.nprobe = 32
+index_final.nprobe = 256
 print(f"索引已准备好搜索 (nprobe={index_final.nprobe})")
 
 print("从 query.fbin 加载查询向量...")
@@ -351,10 +351,7 @@ else:
             # 记录中的第一个整数是维度，我们提取从第二个元素开始的ID列表
             gt_i = record_data[1:]
             
-            # I[i] 是我们搜索得到的k个结果ID
-            # gt_i 是当前查询的groundtruth ID
-            # 使用np.isin高效地计算交集的大小
-            found_count = np.isin(I[i], gt_i).sum()
+            found_count = np.isin(I[i], gt_i[:k]).sum()
             total_found += found_count
             
     # 召回率 = (所有查询找到的正确近邻总数) / (所有查询返回的结果总数)
@@ -380,7 +377,3 @@ if platform.system() in ["Linux", "Darwin"]:
 else:
     print("当前操作系统非 Linux/macOS，无法自动报告峰值内存。")
 print("="*60)
-
-# 注释掉删除索引文件的代码，以便后续重用
-# print(f"\n清理临时索引文件: {INDEX_FILE}")
-# os.remove(INDEX_FILE)
