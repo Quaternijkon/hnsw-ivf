@@ -26,5 +26,7 @@ latex
 faiss/html
 faiss/latex
 tutorial/python/data
+tutorial/python/gist
+tutorial/python/sift
 benchs/data
 tutorial/python/large_ivf_hnsw_on_disk.index

@@ -10,14 +10,14 @@ import re
 # ==============================================================================
 # 0. 路径和文件名配置 & 调试开关
 # ==============================================================================
-DATA_DIR = "./sift"
+DATA_DIR = "./gist"
 LEARN_FILE = os.path.join(DATA_DIR, "learn.fbin")
 BASE_FILE = os.path.join(DATA_DIR, "base.fbin")
 QUERY_FILE = os.path.join(DATA_DIR, "query.fbin")
 GROUNDTRUTH_FILE = os.path.join(DATA_DIR, "groundtruth.ivecs")
 
 # 调试开关 - 设置为True时输出IVF分区统计信息
-ENABLE_IVF_STATS = True  # 控制是否输出IVF分区统计信息
+ENABLE_IVF_STATS = False  # 控制是否输出IVF分区统计信息
 
 # ==============================================================================
 # 1. 辅助函数：读取.fbin文件
@@ -74,6 +74,7 @@ if d_train != d_base or d_train != d_query:
 # 设置其他参数
 cell_size = 128
 nlist = nb // cell_size
+nprobe = 256
 chunk_size = 100000  # 每次处理的数据块大小
 k = 10  # 查找最近的10个邻居
 
@@ -151,8 +152,7 @@ if not skip_index_building:
     index_ondisk = faiss.read_index(INDEX_FILE, IO_FLAG_READ_WRITE)
     start_time = time.time()
 
-    # 保存前5个向量用于Sanity Check
-    sanity_vectors = None
+
 
     num_chunks = (nb + chunk_size - 1) // chunk_size
     for i in range(0, nb, chunk_size):
@@ -162,44 +162,11 @@ if not skip_index_building:
         # 从base.fbin中读取数据块
         xb_chunk, _, _ = read_fbin(BASE_FILE, i, chunk_size)
         
-        # 如果是第一个块，保存前5个向量
-        if i == 0 and sanity_vectors is None:
-            sanity_vectors = xb_chunk[:5].copy()
-        
         index_ondisk.add(xb_chunk)
         del xb_chunk
 
     print(f"\n所有数据块添加完成，总耗时: {time.time() - start_time:.2f} 秒")
     print(f"磁盘索引中的向量总数 (ntotal): {index_ondisk.ntotal}")
-
-    # ===========================================================
-    # Sanity Check - 检查索引是否正常工作
-    # ===========================================================
-    if sanity_vectors is not None:
-        print("\n进行Sanity Check...")
-        print("在索引中搜索前5个向量本身:")
-        D_check, I_check = index_ondisk.search(sanity_vectors, k)
-        
-        print("Sanity Check - 索引结果 (I):")
-        print(I_check)
-        print("Sanity Check - 距离结果 (D):")
-        print(D_check)
-        
-        # 检查结果
-        passed = True
-        for j in range(5):
-            if I_check[j, 0] != j:
-                print(f"警告: 第{j}个向量的最近邻居索引是{I_check[j,0]}而不是{j}")
-                passed = False
-            if not np.isclose(D_check[j, 0], 0.0, atol=1e-5):
-                print(f"警告: 第{j}个向量的最近邻居距离是{D_check[j,0]}而不是0 (允许误差1e-5)")
-        
-        if passed:
-            print("Sanity Check 通过: 所有向量的最近邻居都是自身")
-        else:
-            print("Sanity Check 警告: 某些向量的最近邻居不是自身 (可能是索引配置问题)")
-    else:
-        print("无法进行Sanity Check: 未保存前5个向量")
     
     # ===========================================================
     # 7. 新增: 输出IVF分区统计信息 (仅在构建索引时执行)
@@ -272,7 +239,7 @@ except AttributeError:
 print(f"使用IO标志: {IO_FLAG_MMAP} (内存映射模式)")
 
 index_final = faiss.read_index(INDEX_FILE, IO_FLAG_MMAP)
-index_final.nprobe = 64
+index_final.nprobe = nprobe
 print(f"索引已准备好搜索 (nprobe={index_final.nprobe})")
 
 print("从 query.fbin 加载查询向量...")
@@ -282,25 +249,18 @@ print("执行搜索...")
 start_time = time.time()
 D, I = index_final.search(xq, k)
 end_time = time.time()
-print(f"搜索完成，耗时: {end_time - start_time:.2f} 秒")
 
-# print("\n查询结果的索引 (I[:5])和距离 (D[:5]):")
-# print("索引 (I):")
-# print(I[:5])
-# print("距离 (D):")
-# print(D[:5])
+# --- 新增QPS计算 ---
+search_duration = end_time - start_time
+print(f"搜索完成，耗时: {search_duration:.2f} 秒")
 
-# # 额外的Sanity Check：检查搜索结果的合理性
-# print("\n额外Sanity Check: 检查搜索结果的距离是否合理...")
-# min_dist = D.min()
-# max_dist = D.max()
-# mean_dist = D.mean()
-# print(f"最小距离: {min_dist:.6f}, 最大距离: {max_dist:.6f}, 平均距离: {mean_dist:.6f}")
+if search_duration > 0:
+    qps = nq / search_duration
+    print(f"QPS (每秒查询率): {qps:.2f}")
+else:
+    print("搜索耗时过短，无法计算QPS")
+# --- QPS计算结束 ---
 
-# if min_dist < 0:
-#     print("警告: 发现负距离值，这可能是索引配置问题")
-# else:
-#     print("距离值均为非负，符合预期")
 
 # ==============================================================================
 # 9.  新增: 根据Groundtruth计算召回率 (内存优化版)
@@ -374,6 +334,4 @@ if platform.system() in ["Linux", "Darwin"]:
         peak_memory_bytes *= 1024
     peak_memory_mb = peak_memory_bytes / (1024 * 1024)
     print(f"整个程序运行期间的峰值内存占用: {peak_memory_mb:.2f} MB")
-else:
-    print("当前操作系统非 Linux/macOS，无法自动报告峰值内存。")
 print("="*60)
