@@ -10,7 +10,7 @@ import re
 # ==============================================================================
 # 0. 路径和文件名配置 & 调试开关
 # ==============================================================================
-DATA_DIR = "./sift"
+DATA_DIR = "./gist"
 INDEX_DIR = os.path.join(DATA_DIR, "ondisk-ivf")
 LEARN_FILE = os.path.join(DATA_DIR, "learn.fbin")
 BASE_FILE = os.path.join(DATA_DIR, "base.fbin")
@@ -75,7 +75,7 @@ if d_train != d_base or d_train != d_query:
 # 设置其他参数
 cell_size = 128
 nlist = nb // cell_size
-nprobe = 256
+nprobe = 128
 chunk_size = 100000  # 每次处理的数据块大小
 k = 10  # 查找最近的10个邻居
 

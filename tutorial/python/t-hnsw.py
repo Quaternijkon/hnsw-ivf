@@ -11,6 +11,9 @@ import struct
 # ==============================================================================
 # --- 请将此路径修改为您的sift数据集所在的目录 ---
 DATA_DIR = "./gist"
+# --- 新增: 用于存储持久化索引的目录 ---
+INDEX_CACHE_DIR = "./index_hnsw"
+
 LEARN_FILE = os.path.join(DATA_DIR, "learn.fbin") # HNSW不需要训练，但我们加载它以获取维度信息
 BASE_FILE = os.path.join(DATA_DIR, "base.fbin")
 QUERY_FILE = os.path.join(DATA_DIR, "query.fbin")
@@ -95,6 +98,20 @@ def calculate_recall(search_results_I, groundtruth_path, k):
     
     return recall
 
+# --- 新增函数：获取CPU时间 ---
+def get_cpu_time():
+    """
+    获取当前进程使用的CPU时间（用户+系统）。
+    在Linux/macOS上使用resource模块，在其他系统（如Windows）上回退到time.process_time()。
+    """
+    if platform.system() in ["Linux", "Darwin"]:
+        # resource.getrusage提供了更详细的区分，我们关心用户和系统时间总和
+        rusage = resource.getrusage(resource.RUSAGE_SELF)
+        return rusage.ru_utime + rusage.ru_stime
+    else:
+        # time.process_time()是跨平台的标准方式，返回CPU时间
+        return time.process_time()
+
 def report_peak_memory():
     """报告程序运行期间的峰值内存占用。"""
     print("\n" + "="*60); print("Phase 6: 性能报告")
@@ -134,79 +151,114 @@ print(f"查询集大小 (nq): {nq}")
 print("="*60)
 
 # ==============================================================================
-# 3. 设置HNSW参数并构建索引
+# 3. 设置HNSW参数并加载/构建索引
 # ==============================================================================
 # HNSW 核心参数
 M = 32              # 图中每个节点的邻居数(度)。控制索引的质量和内存占用。
-efConstruction = 40 # 构建图时的搜索范围。影响构建时间和索引质量。
-efSearch = 64      # 搜索时的搜索范围。影响搜索时间和召回率。
+efConstruction = 80 # 构建图时的搜索范围。影响构建时间和索引质量。
+efSearch = 256       # 搜索时的搜索范围。影响搜索时间和召回率。
 k = 10              # k-NN搜索中的k值
 
-print("\nPhase 2: 构建HNSW索引 (in-memory)")
-print(f"HNSW M (邻居数): {M}")
-print(f"HNSW efConstruction (构建参数): {efConstruction}")
+# --- 修改部分：根据参数生成索引文件名 ---
+dataset_name = os.path.basename(os.path.normpath(DATA_DIR))
+index_filename = f"{dataset_name}_HNSW_M{M}_efC{efConstruction}.index"
+index_filepath = os.path.join(INDEX_CACHE_DIR, index_filename)
 
-# 1. 创建HNSW索引对象
-#    参数: 维度, M, 度量方式 (L2范数)
-index_hnsw = faiss.IndexHNSWFlat(d, M, faiss.METRIC_L2)
-index_hnsw.verbose = True
+print(f"\nPhase 2: 加载或构建索引")
+print(f"HNSW 参数: M={M}, efConstruction={efConstruction}")
+print(f"索引文件路径: {index_filepath}")
 
-# 2. 设置构建时参数
-#    efConstruction值越高，构建越慢，但图质量越高
-index_hnsw.hnsw.efConstruction = efConstruction
+# --- 修改部分：检查索引文件是否存在 ---
+if os.path.exists(index_filepath):
+    # 如果文件存在，直接从磁盘加载
+    print("\n  -> 检测到预构建的索引文件，正在从磁盘加载...")
+    start_load_time = time.time()
+    index_hnsw = faiss.read_index(index_filepath)
+    end_load_time = time.time()
+    print(f"  -> 索引加载完成，耗时: {end_load_time - start_load_time:.2f} 秒")
 
-# 3. HNSW索引不需要 .train() 步骤
-print("\n注意: HNSW索引是增量构建的，不需要独立的训练(train)步骤。")
+else:
+    # 如果文件不存在，则构建索引并保存
+    print("\n  -> 未找到索引文件，开始构建新索引...")
+    # 1. 创建HNSW索引对象 (参数: 维度, M, 度量方式)
+    index_hnsw = faiss.IndexHNSWFlat(d, M, faiss.METRIC_L2)
+    index_hnsw.verbose = True
+    index_hnsw.hnsw.efConstruction = efConstruction
 
-# 4. 向索引中添加数据，这一步即是构建图的过程
-print("\nPhase 3: 构建HNSW图 (向索引中添加基础向量)")
-start_time = time.time()
+    print("   -> 注意: HNSW索引是增量构建的，不需要独立的训练(train)步骤。")
+    print("   -> 开始构建HNSW图 (向索引中添加基础向量)...")
+    
+    # --- 修改部分：同时记录墙上时钟时间和CPU时间 ---
+    start_build_wall_time = time.time()
+    start_build_cpu_time = get_cpu_time()
+    
+    index_hnsw.add(xb) # 构建过程
+    
+    end_build_cpu_time = get_cpu_time()
+    end_build_wall_time = time.time()
+    # --- 结束修改 ---
 
-index_hnsw.add(xb) # 在添加向量的同时，HNSW图被构建起来
+    print(f"   -> HNSW图构建完成。")
+    print(f"      - 墙上时钟 (Wall-clock) 耗时: {end_build_wall_time - start_build_wall_time:.2f} 秒")
+    print(f"      - CPU 耗时 (User + System): {end_build_cpu_time - start_build_cpu_time:.2f} 秒")
+    
+    print(f"\n   -> 正在将新索引保存到: {index_filepath}")
+    os.makedirs(INDEX_CACHE_DIR, exist_ok=True)
+    start_save_time = time.time()
+    faiss.write_index(index_hnsw, index_filepath)
+    end_save_time = time.time()
+    print(f"   -> 索引保存完成，耗时: {end_save_time - start_save_time:.2f} 秒")
 
-end_time = time.time()
-print(f"HNSW图构建完成，耗时: {end_time - start_time:.2f} 秒")
 print(f"索引中的向量总数 (ntotal): {index_hnsw.ntotal}")
-
+print("="*60)
 
 # ==============================================================================
 # 4. 执行搜索
 # ==============================================================================
-print("\n" + "="*60)
-print("Phase 4: 执行搜索")
+print(f"\nPhase 3: 执行搜索")
 print(f"搜索近邻数 (k): {k}")
 print(f"HNSW efSearch (搜索参数): {efSearch}")
 
-# 设置搜索时参数
-# efSearch值越高，搜索越慢，但召回率越高
+# 设置搜索时参数 (efSearch值越高，搜索越慢，但召回率越高)
 index_hnsw.hnsw.efSearch = efSearch
 
-print("执行搜索...")
-start_time = time.time()
-D, I = index_hnsw.search(xq, k) # D: 距离, I: 索引ID
-end_time = time.time()
+print("   -> 执行搜索...")
+# --- 修改部分：同时记录墙上时钟时间和CPU时间 ---
+start_search_wall_time = time.time()
+start_search_cpu_time = get_cpu_time()
 
-print(f"搜索完成，耗时: {end_time - start_time:.2f} 秒")
-qps = nq / (end_time - start_time)
-print(f"每秒查询数 (QPS): {qps:.2f}")
+D, I = index_hnsw.search(xq, k)
 
+end_search_cpu_time = get_cpu_time()
+end_search_wall_time = time.time()
+# --- 结束修改 ---
+
+wall_time_diff = end_search_wall_time - start_search_wall_time
+cpu_time_diff = end_search_cpu_time - start_search_cpu_time
+
+qps_wall = nq / wall_time_diff if wall_time_diff > 0 else float('inf')
+qps_cpu = nq / cpu_time_diff if cpu_time_diff > 0 else float('inf')
+
+print(f"   -> 搜索完成。")
+print(f"      - 墙上时钟 (Wall-clock) 耗时: {wall_time_diff:.2f} 秒")
+print(f"      - CPU 耗时 (User + System): {cpu_time_diff:.2f} 秒")
+print(f"   -> 每秒查询数 (QPS, 基于墙上时钟): {qps_wall:.2f}")
+print(f"   -> 每秒查询数 (QPS, 基于CPU时间):  {qps_cpu:.2f}")
+print("="*60)
 
 # ==============================================================================
 # 5. 计算召回率
 # ==============================================================================
-print("\n" + "="*60)
-print("Phase 5: 计算召回率")
+print(f"\nPhase 4: 计算召回率")
 
 # 调用函数，直接传入搜索结果I、groundtruth文件路径和k值
 recall = calculate_recall(I, GROUNDTRUTH_FILE, k)
 print(f"Recall@{k}: {recall:.4f}")
-
 print("="*60)
-
 
 # ==============================================================================
 # 6. 报告峰值内存
 # ==============================================================================
-print("\n" + "="*60)
+print(f"\nPhase 5: 性能报告")
 report_peak_memory()
 print("="*60)

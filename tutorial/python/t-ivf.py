@@ -10,7 +10,7 @@ import struct
 # 0. 路径和超参数配置
 # ==============================================================================
 # --- 请将此路径修改为您的sift数据集所在的目录 ---
-DATA_DIR = "./sift"
+DATA_DIR = "./gist"
 LEARN_FILE = os.path.join(DATA_DIR, "learn.fbin")
 BASE_FILE = os.path.join(DATA_DIR, "base.fbin")
 QUERY_FILE = os.path.join(DATA_DIR, "query.fbin")
@@ -23,7 +23,7 @@ os.makedirs(INDEX_DIR, exist_ok=True)
 # --- 核心超参数配置 --- # <--- MODIFIED: 将超参数移至此处统一管理
 nlist = 7812      # IVF倒排列表的数量 (聚类中心数)
 k = 10             # k-NN搜索中的k值
-nprobe = 64        # 搜索时要访问的倒排列表数量
+nprobe = 128        # 搜索时要访问的倒排列表数量
 
 # --- 动态生成索引文件名 --- # <--- MODIFIED: 文件名与nlist参数绑定
 INDEX_FILENAME = f"sift_ivf_nlist{nlist}.index"

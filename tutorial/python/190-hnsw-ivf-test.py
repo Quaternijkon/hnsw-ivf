@@ -16,8 +16,13 @@ BASE_FILE = os.path.join(DATA_DIR, "base.fbin")
 QUERY_FILE = os.path.join(DATA_DIR, "query.fbin")
 GROUNDTRUTH_FILE = os.path.join(DATA_DIR, "groundtruth.ivecs")
 
-# 调试开关 - 设置为True时输出IVF分区统计信息
-ENABLE_IVF_STATS = False  # 控制是否输出IVF分区统计信息
+# 调试开关
+ENABLE_IVF_STATS = True  # 控制是否输出IVF分区统计信息
+
+# 新增开关 - 控制是否统计搜索分区信息
+ENABLE_SEARCH_PARTITION_STATS = True
+SEARCH_STATS_FILENAME = os.path.join(DATA_DIR, "search_partition_ratios.txt")
+
 
 # ==============================================================================
 # 1. 辅助函数：读取.fbin文件
@@ -72,9 +77,9 @@ if d_train != d_base or d_train != d_query:
     raise ValueError(f"维度不一致: 训练集{d_train}维, 基础集{d_base}维, 查询集{d_query}维")
 
 # 设置其他参数
-cell_size = 128
+cell_size = 64
 nlist = nb // cell_size
-nprobe = 256
+nprobe = 64
 chunk_size = 100000  # 每次处理的数据块大小
 k = 10  # 查找最近的10个邻居
 
@@ -91,6 +96,7 @@ print(f"基础集大小 (nb): {nb}, 训练集大小 (ntrain): {nt}")
 print(f"查询集大小 (nq): {nq}, 分块大小 (chunk_size): {chunk_size}")
 print(f"索引将保存在磁盘文件: {INDEX_FILE}")
 print(f"IVF统计功能: {'启用' if ENABLE_IVF_STATS else '禁用'}")
+print(f"搜索分区统计功能: {'启用' if ENABLE_SEARCH_PARTITION_STATS else '禁用'}")
 print("="*60)
 
 # ==============================================================================
@@ -157,7 +163,7 @@ if not skip_index_building:
     num_chunks = (nb + chunk_size - 1) // chunk_size
     for i in range(0, nb, chunk_size):
         chunk_idx = i // chunk_size + 1
-        print(f"    -> 正在处理块 {chunk_idx}/{num_chunks}: 向量 {i} 到 {min(i+chunk_size, nb)-1}")
+        print(f"      -> 正在处理块 {chunk_idx}/{num_chunks}: 向量 {i} 到 {min(i+chunk_size, nb)-1}")
         
         # 从base.fbin中读取数据块
         xb_chunk, _, _ = read_fbin(BASE_FILE, i, chunk_size)
@@ -188,14 +194,22 @@ if not skip_index_building:
         # 遍历所有分区
         for list_id in range(nlist):
             list_size = invlists.list_size(list_id)
+            
+            # 修改点 1：无论分区大小是否为0，都记录下来，以便生成完整的CSV报告
+            partition_stats.append((list_id, list_size))
+            
+            # 仅针对非空分区更新摘要统计信息
             if list_size > 0:
                 non_empty_partitions += 1
                 max_size = max(max_size, list_size)
                 min_size = min(min_size, list_size)
                 total_vectors += list_size
-                partition_stats.append((list_id, list_size))
+                
+        # 修改点 2：处理没有非空分区的边缘情况，避免打印 'inf'
+        if non_empty_partitions == 0:
+            min_size = 0
         
-        # 计算平均值
+        # 计算非空分区的平均大小 (total_vectors 是非空分区中的向量总数)
         avg_size = total_vectors / non_empty_partitions if non_empty_partitions > 0 else 0
         
         # 输出统计摘要
@@ -203,16 +217,19 @@ if not skip_index_building:
         print(f"  分区总数: {nlist}")
         print(f"  非空分区数: {non_empty_partitions} ({non_empty_partitions/nlist*100:.2f}%)")
         print(f"  最大分区大小: {max_size}")
-        print(f"  最小分区大小: {min_size}")
-        print(f"  平均分区大小: {avg_size:.2f}")
+        # 修改点 3：为了清晰起见，明确指出这是非空分区的最小值
+        print(f"  最小(非空)分区大小: {min_size}")
+        # 修改点 3：为了清晰起见，明确指出这是非空分区的平均值
+        print(f"  平均(非空)分区大小: {avg_size:.2f}")
         
         # 将详细统计信息写入文件
+        # 此部分无需修改，因为它现在会正确处理包含所有分区的 partition_stats 列表
         stats_filename = os.path.splitext(INDEX_FILE)[0] + "_ivf_stats.csv"
         with open(stats_filename, 'w') as f:
             f.write("partition_id,vector_count\n")
             for list_id, size in partition_stats:
                 f.write(f"{list_id},{size}\n")
-        
+                
         print(f"分区统计信息已保存到: {stats_filename}")
         print(f"统计耗时: {time.time() - start_stats_time:.2f}秒")
     
@@ -245,7 +262,58 @@ print(f"索引已准备好搜索 (nprobe={index_final.nprobe})")
 print("从 query.fbin 加载查询向量...")
 xq = read_fbin(QUERY_FILE)
 
-print("执行搜索...")
+# ==============================================================================
+# 8.5. 新增: 统计并保存每个查询命中的分区点数占总点数的比例
+# ==============================================================================
+if ENABLE_SEARCH_PARTITION_STATS:
+    print("\n" + "="*60)
+    print(f"Phase 4.5: 统计搜索分区信息 (nprobe={nprobe})")
+    
+    # 检查索引是否为IVF类型，因为该逻辑依赖于quantizer和invlists
+    if not isinstance(index_final, faiss.IndexIVF):
+        print("错误：索引类型不是IndexIVF，无法执行分区统计。")
+    else:
+        total_vectors_in_index = index_final.ntotal
+        print(f"索引中的总向量数: {total_vectors_in_index}")
+        
+        if total_vectors_in_index == 0:
+            print("警告：索引中没有向量，所有比例将为0。")
+        
+        print("正在为每个查询向量查找对应的分区...")
+        # 1. 对每个查询向量，用粗量化器找到nprobe个最近的簇心(分区)
+        # I_quant 的维度是 (nq, nprobe)，存储了每个查询命中的分区ID
+        _ , I_quant = index_final.quantizer.search(xq, nprobe)
+        
+        ratios = []
+        print(f"正在计算 {nq} 个查询的命中分区点数比例...")
+        
+        # 2. 遍历每个查询的结果
+        for i in range(nq):
+            probed_list_ids = I_quant[i]
+            
+            # 3. 累加这些分区中的向量总数
+            num_vectors_in_probed_partitions = 0
+            for list_id in probed_list_ids:
+                if list_id >= 0: # 有效的分区ID
+                    num_vectors_in_probed_partitions += index_final.invlists.list_size(int(list_id))
+            
+            # 4. 计算比例
+            ratio = num_vectors_in_probed_partitions / total_vectors_in_index if total_vectors_in_index > 0 else 0
+            ratios.append(ratio)
+
+        # 5. 将结果写入文件
+        try:
+            with open(SEARCH_STATS_FILENAME, 'w') as f:
+                for ratio in ratios:
+                    f.write(f"{ratio:.8f}\n") # 写入时保留8位小数
+            print(f"搜索分区统计比例已成功写入文件: {SEARCH_STATS_FILENAME}")
+        except IOError as e:
+            print(f"错误：无法写入统计文件 {SEARCH_STATS_FILENAME}。原因: {e}")
+            
+    print("="*60)
+
+
+print("\n执行搜索...")
 start_time = time.time()
 D, I = index_final.search(xq, k)
 end_time = time.time()
@@ -295,7 +363,7 @@ else:
         total_file_size = f.tell()
         num_gt_vectors = total_file_size // record_size_bytes
         if nq != num_gt_vectors:
-             print(f"警告: 查询数量({nq})与groundtruth中的数量({num_gt_vectors})不匹配!")
+              print(f"警告: 查询数量({nq})与groundtruth中的数量({num_gt_vectors})不匹配!")
 
         print(f"正在计算 Recall@{k}...")
         
