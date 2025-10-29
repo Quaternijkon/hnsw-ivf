@@ -1,0 +1,6 @@
+=== Faiss 磁盘 vs 内存磁盘性能对比实验 ===
+✅ 所有必要文件都存在
+创建测试工作空间...
+创建内存磁盘 (tmpfs)...
+sudo: a terminal is required to read the password; either use the -S option to read from standard input or configure an askpass helper
+❌ 内存磁盘创建失败，请检查sudo权限

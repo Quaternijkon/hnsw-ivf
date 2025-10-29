@@ -1,0 +1,89 @@
+================================================================================
+              Faiss Benchmark 程序编译快速参考
+================================================================================
+
+三个程序 Makefile 位置
+--------------------------------------------------------------------------------
+1. benchmark-ivf/Makefile          -> benchmark_ivf
+2. benchmark-hnsw/Makefile         -> benchmark_hnsw  
+3. benchmark-ivf-ondisk/Makefile   -> benchmark_ivf_ondisk
+
+编译命令（在各自目录下）
+--------------------------------------------------------------------------------
+make            # 编译程序
+make run        # 编译并运行（使用默认配置）
+make clean      # 清理编译产物和结果文件
+
+快速编译所有程序
+--------------------------------------------------------------------------------
+cd /home/gpu/dry/faiss/tutorial/cpp
+(cd benchmark-ivf && make) && \
+(cd benchmark-hnsw && make) && \
+(cd benchmark-ivf-ondisk && make)
+
+验证编译结果
+--------------------------------------------------------------------------------
+ls -lh benchmark-*/benchmark_*
+
+# 应显示三个 ~7.0M 的可执行文件
+
+运行程序
+--------------------------------------------------------------------------------
+# 使用默认配置文件
+./benchmark-ivf/benchmark_ivf
+./benchmark-hnsw/benchmark_hnsw
+./benchmark-ivf-ondisk/benchmark_ivf_ondisk
+
+# 指定配置文件
+./benchmark-ivf/benchmark_ivf my_config.config
+./benchmark-hnsw/benchmark_hnsw my_config.config
+./benchmark-ivf-ondisk/benchmark_ivf_ondisk my_config.config
+
+编译参数（所有程序统一）
+--------------------------------------------------------------------------------
+-std=c++17              C++17 标准
+-O3                     最高优化级别
+-fopenmp                OpenMP 并行
+-march=native           CPU 指令集优化
+-I../../..              Faiss 头文件路径
+-I..                    config_parser.h 路径
+-L../../../build/faiss  Faiss 库路径
+-Wl,-rpath,...          运行时库路径
+-lfaiss -lopenblas      链接库
+
+清理所有编译产物
+--------------------------------------------------------------------------------
+for dir in benchmark-ivf benchmark-hnsw benchmark-ivf-ondisk; do
+    (cd $dir && make clean)
+done
+
+常见问题快速解决
+--------------------------------------------------------------------------------
+问题: 找不到 faiss 头文件
+解决: 确保 Faiss 已编译在 ../../../build/faiss
+
+问题: 找不到 config_parser.h  
+解决: 确保 Makefile 包含 -I..
+
+问题: 运行时找不到 libfaiss.so
+解决: Makefile 已设置 rpath，无需手动设置 LD_LIBRARY_PATH
+
+内存需求对比
+--------------------------------------------------------------------------------
+benchmark_ivf          ~2-3 GB    (原始版本，一次性加载)
+benchmark_hnsw         ~1-2 GB    (HNSW 相对较小)
+benchmark_ivf_ondisk   ~500MB-1GB (优化版本，分块处理+mmap)
+
+输出文件
+--------------------------------------------------------------------------------
+benchmark_xxx_build_results_<timestamp>.csv   (构建结果)
+benchmark_xxx_search_results_<timestamp>.csv  (搜索结果)
+
+性能优化提示
+--------------------------------------------------------------------------------
+export OMP_NUM_THREADS=20  # 设置线程数（根据 CPU 核心数）
+ulimit -s unlimited        # 增加栈大小（如需要）
+
+================================================================================
+详细文档: 查看 MAKEFILE_GUIDE.md
+================================================================================

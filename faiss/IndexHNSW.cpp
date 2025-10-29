@@ -19,12 +19,14 @@
 #include <memory>
 #include <queue>
 #include <random>
+#include <chrono>
 
 #include <cstdint>
 
 #include <faiss/Index2Layer.h>
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVFPQ.h>
+#include <faiss/IndexIVF.h>
 #include <faiss/impl/AuxIndexStructures.h>
 #include <faiss/impl/FaissAssert.h>
 #include <faiss/impl/ResultHandler.h>
@@ -32,6 +34,16 @@
 #include <faiss/utils/sorting.h>
 
 namespace faiss {
+
+// Timer class for latency measurement
+struct HNSWTimer {
+    std::chrono::high_resolution_clock::time_point t0;
+    HNSWTimer() : t0(std::chrono::high_resolution_clock::now()) {}
+    double elapsed_us() const {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration<double, std::micro>(t1 - t0).count();
+    }
+};
 
 using MinimaxHeap = HNSW::MinimaxHeap;
 using storage_idx_t = HNSW::storage_idx_t;
@@ -237,7 +249,8 @@ void hnsw_search(
         idx_t n,
         const float* x,
         BlockResultHandler& bres,
-        const SearchParameters* params_in) {
+        const SearchParameters* params_in,
+        QueryLatencyStats* per_query_stats = nullptr) {
     FAISS_THROW_IF_NOT_MSG(
             index->storage,
             "No storage index, please use IndexHNSWFlat (or variants) "
@@ -252,6 +265,11 @@ void hnsw_search(
         efSearch = params->efSearch;
     }
     size_t n1 = 0, n2 = 0, ndis = 0, nhops = 0;
+
+    // Initialize per-query stats if provided
+    if (per_query_stats) {
+        memset(per_query_stats, 0, sizeof(QueryLatencyStats) * n);
+    }
 
     idx_t check_period = InterruptCallback::get_period_hint(
             hnsw.max_level * index->d * efSearch);
@@ -269,6 +287,12 @@ void hnsw_search(
 
 #pragma omp for reduction(+ : n1, n2, ndis, nhops) schedule(guided)
             for (idx_t i = i0; i < i1; i++) {
+                // Start timing for this query if stats are requested
+                std::unique_ptr<HNSWTimer> query_timer = nullptr;
+                if (per_query_stats != nullptr) {
+                    query_timer = std::make_unique<HNSWTimer>();
+                }
+
                 res.begin(i);
                 dis->set_query(x + i * index->d);
 
@@ -278,6 +302,14 @@ void hnsw_search(
                 ndis += stats.ndis;
                 nhops += stats.nhops;
                 res.end();
+
+                // Record timing if stats are requested
+                if (query_timer) {
+                    per_query_stats[i].total_us = query_timer->elapsed_us();
+                    // HNSW doesn't have quantization phase, so leave it as 0
+                    per_query_stats[i].quantization_us = 0.0;
+                    per_query_stats[i].list_scan_us = per_query_stats[i].total_us;
+                }
             }
         }
         InterruptCallback::check();
@@ -301,6 +333,29 @@ void IndexHNSW::search(
     RH bres(n, distances, labels, k);
 
     hnsw_search(this, n, x, bres, params_in);
+
+    if (is_similarity_metric(this->metric_type)) {
+        // we need to revert the negated distances
+        for (size_t i = 0; i < k * n; i++) {
+            distances[i] = -distances[i];
+        }
+    }
+}
+
+void IndexHNSW::search_stats(
+        idx_t n,
+        const float* x,
+        idx_t k,
+        float* distances,
+        idx_t* labels,
+        const SearchParameters* params_in,
+        QueryLatencyStats* per_query_stats) const {
+    FAISS_THROW_IF_NOT(k > 0);
+
+    using RH = HeapBlockResultHandler<HNSW::C>;
+    RH bres(n, distances, labels, k);
+
+    hnsw_search(this, n, x, bres, params_in, per_query_stats);
 
     if (is_similarity_metric(this->metric_type)) {
         // we need to revert the negated distances

@@ -65,6 +65,16 @@ struct IndexHNSW : Index {
             idx_t* labels,
             const SearchParameters* params = nullptr) const override;
 
+    /// search with per-query latency statistics
+    void search_stats(
+            idx_t n,
+            const float* x,
+            idx_t k,
+            float* distances,
+            idx_t* labels,
+            const SearchParameters* params = nullptr,
+            QueryLatencyStats* per_query_stats = nullptr) const;
+
     void range_search(
             idx_t n,
             const float* x,
