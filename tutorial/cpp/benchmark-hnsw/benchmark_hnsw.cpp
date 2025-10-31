@@ -205,8 +205,8 @@ double calculateRecall(const vector<idx_t>& search_results, const vector<vector<
     return static_cast<double>(total_found) / (nq * k);
 }
 
-// 执行build测试
-TestResult runBuildTest(int M, int efconstruction, size_t d, size_t nb) {
+// 执行build测试，返回索引指针
+pair<TestResult, faiss::IndexHNSWFlat*> runBuildTest(int M, int efconstruction, size_t d, size_t nb) {
     TestResult result;
     result.M = M;
     result.efconstruction = efconstruction;
@@ -247,34 +247,19 @@ TestResult runBuildTest(int M, int efconstruction, size_t d, size_t nb) {
     cout << "初始化阶段峰值内存: " << fixed << setprecision(2) << result.training_memory_mb << "MB" << endl;
     cout << "添加数据阶段峰值内存: " << fixed << setprecision(2) << result.add_memory_mb << "MB" << endl;
     
-    // 保存索引供search测试使用
-    string index_filename = DATA_DIR + "/temp_index_M" + to_string(M) + 
-                           "_efc" + to_string(efconstruction) + ".index";
-    faiss::write_index(index, index_filename.c_str());
-    
-    delete index;
-    
-    return result;
+    return {result, index};
 }
 
-// 执行search测试
+// 执行search测试，直接使用内存中的索引
 TestResult runSearchTest(int efsearch, const TestResult& build_result, 
-                        size_t /*d*/, size_t nq, size_t k) {
+                        faiss::IndexHNSWFlat* index, size_t /*d*/, size_t nq, size_t k) {
     TestResult result = build_result;
     result.efsearch = efsearch;
     
     cout << "\n=== Search测试: efsearch=" << efsearch << " ===" << endl;
     
-    // 加载索引
-    string index_filename = DATA_DIR + "/temp_index_M" + to_string(build_result.M) + 
-                           "_efc" + to_string(build_result.efconstruction) + ".index";
-    
-    int IO_FLAG_MMAP = faiss::IO_FLAG_MMAP;
-    faiss::Index* index = faiss::read_index(index_filename.c_str(), IO_FLAG_MMAP);
-    
     // 设置搜索参数
-    faiss::IndexHNSW* hnsw_index = dynamic_cast<faiss::IndexHNSW*>(index);
-    hnsw_index->hnsw.efSearch = efsearch;
+    index->hnsw.efSearch = efsearch;
     
     // 开始监控搜索阶段的峰值内存
     PeakMemoryMonitor search_memory_monitor;
@@ -293,7 +278,7 @@ TestResult runSearchTest(int efsearch, const TestResult& build_result,
     
     // 使用 search_stats 批量查询并记录每个查询的延迟
     auto search_start = chrono::high_resolution_clock::now();
-    hnsw_index->search_stats(nq, xq, k, D.data(), I.data(), nullptr, latency_stats.data());
+    index->search_stats(nq, xq, k, D.data(), I.data(), nullptr, latency_stats.data());
     auto search_end = chrono::high_resolution_clock::now();
     search_memory_monitor.update();
     
@@ -330,64 +315,64 @@ TestResult runSearchTest(int efsearch, const TestResult& build_result,
     cout << "P99延迟: " << fixed << setprecision(4) << result.latency.p99_latency_ms << "ms" << endl;
     cout << "召回率: " << fixed << setprecision(4) << result.recall << endl;
     
-    delete index;
-    
     return result;
 }
 
-// 保存build结果到CSV
-void saveBuildResultsToCSV(const vector<TestResult>& build_results, const string& filename) {
-    ofstream file(filename);
+// 追加build结果到CSV（首次调用会写入头部）
+void appendBuildResultToCSV(const TestResult& result, const string& filename, bool is_first_record = false) {
+    ofstream file(filename, ios::app);
     if (!file.is_open()) {
-        throw runtime_error("无法创建CSV文件: " + filename);
+        throw runtime_error("无法打开CSV文件: " + filename);
     }
     
-    // 写入CSV头部
-    file << "M,efconstruction,training_memory_mb,add_memory_mb,training_time_s,total_time_s" << endl;
+    // 如果是首次写入，写入CSV头部
+    if (is_first_record) {
+        file << "M,efconstruction,training_memory_mb,add_memory_mb,training_time_s,total_time_s" << endl;
+    }
     
     // 写入数据
-    for (const auto& result : build_results) {
-        file << result.M << "," << result.efconstruction << ","
-             << fixed << setprecision(2) << result.training_memory_mb << ","
-             << fixed << setprecision(2) << result.add_memory_mb << ","
-             << fixed << setprecision(4) << result.training_time_s << ","
-             << fixed << setprecision(4) << result.total_time_s << endl;
-    }
+    file << result.M << "," << result.efconstruction << ","
+         << fixed << setprecision(2) << result.training_memory_mb << ","
+         << fixed << setprecision(2) << result.add_memory_mb << ","
+         << fixed << setprecision(4) << result.training_time_s << ","
+         << fixed << setprecision(4) << result.total_time_s << endl;
     
+    // 立即刷新到磁盘，确保数据不会丢失
+    file.flush();
     file.close();
-    cout << "\nBuild结果已保存到: " << filename << endl;
 }
 
-// 保存search结果到CSV
-void saveSearchResultsToCSV(const vector<TestResult>& search_results, const string& filename) {
-    ofstream file(filename);
+// 追加search结果到CSV（首次调用会写入头部）
+void appendSearchResultToCSV(const TestResult& result, const string& filename, bool is_first_record = false) {
+    ofstream file(filename, ios::app);
     if (!file.is_open()) {
-        throw runtime_error("无法创建CSV文件: " + filename);
+        throw runtime_error("无法打开CSV文件: " + filename);
     }
     
-    // 写入CSV头部
-    file << "M,efconstruction,efsearch,training_memory_mb,add_memory_mb,training_time_s,total_time_s,"
-         << "recall,qps,mspq,search_memory_mb,search_time_s,mean_latency_ms,p50_latency_ms,p99_latency_ms" << endl;
+    // 如果是首次写入，写入CSV头部
+    if (is_first_record) {
+        file << "M,efconstruction,efsearch,training_memory_mb,add_memory_mb,training_time_s,total_time_s,"
+             << "recall,qps,mspq,search_memory_mb,search_time_s,mean_latency_ms,p50_latency_ms,p99_latency_ms" << endl;
+    }
     
     // 写入数据
-    for (const auto& result : search_results) {
-        file << result.M << "," << result.efconstruction << "," << result.efsearch << ","
-             << fixed << setprecision(2) << result.training_memory_mb << ","
-             << fixed << setprecision(2) << result.add_memory_mb << ","
-             << fixed << setprecision(4) << result.training_time_s << ","
-             << fixed << setprecision(4) << result.total_time_s << ","
-             << fixed << setprecision(4) << result.recall << ","
-             << fixed << setprecision(2) << result.qps << ","
-             << fixed << setprecision(4) << result.mspq << ","
-             << fixed << setprecision(2) << result.search_memory_mb << ","
-             << fixed << setprecision(4) << result.search_time_s << ","
-             << fixed << setprecision(4) << result.latency.mean_latency_ms << ","
-             << fixed << setprecision(4) << result.latency.p50_latency_ms << ","
-             << fixed << setprecision(4) << result.latency.p99_latency_ms << endl;
-    }
+    file << result.M << "," << result.efconstruction << "," << result.efsearch << ","
+         << fixed << setprecision(2) << result.training_memory_mb << ","
+         << fixed << setprecision(2) << result.add_memory_mb << ","
+         << fixed << setprecision(4) << result.training_time_s << ","
+         << fixed << setprecision(4) << result.total_time_s << ","
+         << fixed << setprecision(4) << result.recall << ","
+         << fixed << setprecision(2) << result.qps << ","
+         << fixed << setprecision(4) << result.mspq << ","
+         << fixed << setprecision(2) << result.search_memory_mb << ","
+         << fixed << setprecision(4) << result.search_time_s << ","
+         << fixed << setprecision(4) << result.latency.mean_latency_ms << ","
+         << fixed << setprecision(4) << result.latency.p50_latency_ms << ","
+         << fixed << setprecision(4) << result.latency.p99_latency_ms << endl;
     
+    // 立即刷新到磁盘，确保数据不会丢失
+    file.flush();
     file.close();
-    cout << "\nSearch结果已保存到: " << filename << endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -420,58 +405,106 @@ int main(int argc, char* argv[]) {
     cout << "  基础集大小: " << nb << endl;
     cout << "  查询集大小: " << nq << endl;
     
-    vector<TestResult> all_results;
+    // 生成结果文件名（带时间戳）
+    string timestamp = to_string(chrono::duration_cast<chrono::seconds>(
+        chrono::system_clock::now().time_since_epoch()).count());
+    string build_csv_filename = "benchmark_hnsw_build_results_" + timestamp + ".csv";
+    string search_csv_filename = "benchmark_hnsw_search_results_" + timestamp + ".csv";
     
-    // 执行build测试
-    cout << "\n=== 开始Build测试 ===" << endl;
-    vector<TestResult> build_results;
+    // 标记是否是首次写入（用于写入CSV头部）
+    bool first_build_record = true;
+    bool first_search_record = true;
+    
+    int total_test_count = 0;
+    int total_build_count = 0;
+    
+    // 测试流程：对每个build参数组合
+    // 1. 构建索引
+    // 2. 立即保存build结果到文件（立即刷新到磁盘）
+    // 3. 对该索引立即进行所有search参数组合的测试
+    // 4. 每个search测试完成后立即保存结果到文件（立即刷新到磁盘）
+    // 5. 所有search测试完成后立即删除索引，释放内存
+    // 6. 继续下一个build参数组合
+    // 
+    // 优点：
+    // - 避免索引占据大量存储空间（同时只存在一个索引）
+    // - 避免缓存大量实验数据（每个测试完成后立即写入文件）
+    // - 避免意外中断丢失实验数据（每次写入后立即刷新到磁盘）
+    cout << "\n=== 开始Benchmark测试（每构建一个索引立即测试并删除，结果实时保存）===" << endl;
     
     for (int M : config.build.params["M"]) {
         for (int efconstruction : config.build.params["efconstruction"]) {
-            TestResult build_result = runBuildTest(M, efconstruction, d, nb);
-            build_results.push_back(build_result);
-        }
-    }
-    
-    // 对每个build结果执行search测试
-    cout << "\n=== 开始Search测试 ===" << endl;
-    
-    for (const auto& build_result : build_results) {
-        for (double efsearch_ratio : config.search.params["efsearch_ratio"]) {
-            // 计算efsearch = efconstruction * efsearch_ratio，确保至少为k
-            int efsearch = max(static_cast<int>(k), static_cast<int>(build_result.efconstruction * efsearch_ratio));
+            total_build_count++;
+            faiss::IndexHNSWFlat* index = nullptr;
             
-            cout << "计算参数: M=" << build_result.M 
-                 << ", efconstruction=" << build_result.efconstruction
-                 << ", efsearch_ratio=" << efsearch_ratio 
-                 << " -> efsearch=" << efsearch << endl;
-            
-            TestResult search_result = runSearchTest(efsearch, build_result, d, nq, k);
-            all_results.push_back(search_result);
+            try {
+                // 1. 构建索引
+                cout << "\n[构建 " << total_build_count << "] M=" << M << ", efconstruction=" << efconstruction << endl;
+                auto [build_result, index_ptr] = runBuildTest(M, efconstruction, d, nb);
+                index = index_ptr;
+                
+                // 2. 立即保存build结果到文件（立即刷新到磁盘）
+                appendBuildResultToCSV(build_result, build_csv_filename, first_build_record);
+                if (first_build_record) {
+                    first_build_record = false;
+                    cout << "Build结果已保存到: " << build_csv_filename << endl;
+                }
+                cout << "Build结果已实时保存并刷新到磁盘" << endl;
+                
+                // 3. 对该索引立即进行所有search测试
+                cout << "\n=== 开始Search测试: M=" << M << ", efconstruction=" << efconstruction << " ===" << endl;
+                int search_test_count = 0;
+                
+                for (double efsearch_ratio : config.search.params["efsearch_ratio"]) {
+                    // 计算efsearch = efconstruction * efsearch_ratio，确保至少为k
+                    int efsearch = max(static_cast<int>(k), static_cast<int>(build_result.efconstruction * efsearch_ratio));
+                    
+                    search_test_count++;
+                    cout << "\n[Search测试 " << search_test_count << "] "
+                         << "M=" << build_result.M 
+                         << ", efconstruction=" << build_result.efconstruction
+                         << ", efsearch_ratio=" << efsearch_ratio 
+                         << " -> efsearch=" << efsearch << endl;
+                    
+                    TestResult search_result = runSearchTest(efsearch, build_result, index, d, nq, k);
+                    total_test_count++;
+                    
+                    // 4. 立即保存search结果到文件（立即刷新到磁盘）
+                    appendSearchResultToCSV(search_result, search_csv_filename, first_search_record);
+                    if (first_search_record) {
+                        first_search_record = false;
+                        cout << "Search结果已保存到: " << search_csv_filename << endl;
+                    }
+                    cout << "Search结果已实时保存并刷新到磁盘" << endl;
+                }
+                
+                // 5. 所有search测试完成后立即删除索引，释放内存
+                delete index;
+                index = nullptr;
+                
+                // 显式清理内存（建议操作系统回收内存）
+                // 注意：这只是建议，实际回收由操作系统决定
+                cout << "\n索引已删除，内存已释放（建议操作系统回收）" << endl;
+                
+            } catch (const exception& e) {
+                // 错误处理：确保即使出错也能保存已完成的测试结果
+                cerr << "错误: " << e.what() << endl;
+                if (index != nullptr) {
+                    delete index;
+                    index = nullptr;
+                }
+                cerr << "已清理资源，继续下一个测试..." << endl;
+                continue;
+            }
         }
-    }
-    
-    // 保存结果
-    string timestamp = to_string(chrono::duration_cast<chrono::seconds>(
-        chrono::system_clock::now().time_since_epoch()).count());
-    
-    // 保存build结果
-    string build_csv_filename = "benchmark_hnsw_build_results_" + timestamp + ".csv";
-    saveBuildResultsToCSV(build_results, build_csv_filename);
-    
-    // 保存search结果
-    string search_csv_filename = "benchmark_hnsw_search_results_" + timestamp + ".csv";
-    saveSearchResultsToCSV(all_results, search_csv_filename);
-    
-    // 清理临时索引文件
-    for (const auto& build_result : build_results) {
-        string index_filename = DATA_DIR + "/temp_index_M" + to_string(build_result.M) + 
-                               "_efc" + to_string(build_result.efconstruction) + ".index";
-        remove(index_filename.c_str());
     }
     
     cout << "\n=== Benchmark测试完成 ===" << endl;
-    cout << "总共执行了 " << all_results.size() << " 次测试" << endl;
+    cout << "总共构建了 " << total_build_count << " 个索引" << endl;
+    cout << "总共执行了 " << total_test_count << " 次搜索测试" << endl;
+    cout << "Build结果保存在: " << build_csv_filename << endl;
+    cout << "Search结果保存在: " << search_csv_filename << endl;
+    cout << "所有结果已实时保存到磁盘，即使意外中断也不会丢失数据" << endl;
     
     return 0;
 }

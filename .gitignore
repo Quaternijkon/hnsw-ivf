@@ -36,3 +36,4 @@ tutorial/python/large_ivf_hnsw_on_disk.index
 benchs/bench_all_ivf/data
 tutorial/cpp/disk_workspace
 tutorial/cpp/memory_workspace
+tutorial/cpp/benchmark-hnsw-ivf/indices
