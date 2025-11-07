@@ -1,0 +1,4 @@
+M,nlist,efconstruction,training_memory_mb,add_memory_mb,training_time_s,total_time_s
+8,1000,40,61.00,744.00,0.5549,2.5656
+8,1000,80,83.00,763.00,0.5372,2.4545
+8,1000,120,97.00,758.00,0.5458,2.5327

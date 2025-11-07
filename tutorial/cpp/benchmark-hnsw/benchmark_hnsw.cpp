@@ -226,6 +226,7 @@ pair<TestResult, faiss::IndexHNSWFlat*> runBuildTest(int M, int efconstruction, 
     memory_monitor.update();
     
     // 记录初始化后的内存（对应training_memory）
+    // 注意：HNSW不需要训练，所以training_memory只包括索引对象本身，不包括训练数据
     result.training_memory_mb = memory_monitor.getPeakMemoryMB();
     
     // 添加数据阶段
@@ -236,8 +237,14 @@ pair<TestResult, faiss::IndexHNSWFlat*> runBuildTest(int M, int efconstruction, 
     index->add(nb, xb);
     memory_monitor.update();
     
-    // 记录添加数据阶段的峰值内存
+    // 记录添加数据阶段的峰值内存（包括基础数据）
     result.add_memory_mb = memory_monitor.getPeakMemoryMB();
+    
+    // 添加数据完成后立即释放基础数据以节省内存（与其他benchmark对齐）
+    // 这样在runSearchTest开始时，内存中只包含索引，不包括基础数据
+    xb_data.clear();
+    xb_data.shrink_to_fit();  // 强制释放vector内存
+    memory_monitor.update();
     
     auto end_time = chrono::high_resolution_clock::now();
     result.total_time_s = chrono::duration<double>(end_time - start_time).count();
@@ -262,6 +269,7 @@ TestResult runSearchTest(int efsearch, const TestResult& build_result,
     index->hnsw.efSearch = efsearch;
     
     // 开始监控搜索阶段的峰值内存
+    // 注意：此时基础数据已经在runBuildTest中释放，内存中只包含索引
     PeakMemoryMonitor search_memory_monitor;
     search_memory_monitor.start();
     
@@ -286,8 +294,11 @@ TestResult runSearchTest(int efsearch, const TestResult& build_result,
     result.qps = nq / result.search_time_s;
     result.mspq = (result.search_time_s * 1000.0) / nq;  // 转换为毫秒
     
-    // 记录搜索阶段的峰值内存
+    // 记录搜索阶段的峰值内存（在加载groundtruth之前）
     result.search_memory_mb = search_memory_monitor.getPeakMemoryMB();
+    
+    // 停止内存监控，后续操作（如加载groundtruth）不计入搜索阶段内存
+    search_memory_monitor.stop();
     
     // 从 QueryLatencyStats 提取延迟数据（微秒转换为毫秒）
     vector<double> latencies_ms;
@@ -298,7 +309,7 @@ TestResult runSearchTest(int efsearch, const TestResult& build_result,
     // 计算延迟统计
     result.latency = calculateLatencyStats(latencies_ms);
     
-    // 计算召回率
+    // 计算召回率（在内存监控停止后，不计入搜索阶段内存）
     ifstream gt_file_check(GROUNDTRUTH_FILE);
     if (gt_file_check.good()) {
         vector<vector<int32_t>> groundtruth = read_ivecs(GROUNDTRUTH_FILE);

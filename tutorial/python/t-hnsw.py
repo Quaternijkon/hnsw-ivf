@@ -112,14 +112,82 @@ def get_cpu_time():
         # time.process_time()是跨平台的标准方式，返回CPU时间
         return time.process_time()
 
+# --- 新增：获取当前RSS内存（与C++脚本对齐的方法） ---
+def get_current_memory_mb():
+    """
+    获取当前进程的实际物理内存使用量（RSS，与C++脚本的方法对齐）。
+    通过读取 /proc/self/status 中的 VmRSS 字段。
+    返回MB为单位的内存使用量。
+    """
+    if platform.system() == "Linux":
+        try:
+            with open('/proc/self/status', 'r') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        # 格式: VmRSS:    12345 kB
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            # 转换为MB (kB / 1024)
+                            return int(parts[1]) / 1024.0
+        except (IOError, ValueError, IndexError):
+            pass
+    # 回退到resource.getrusage方法（适用于macOS或无法读取/proc时）
+    if platform.system() in ["Linux", "Darwin"]:
+        rusage = resource.getrusage(resource.RUSAGE_SELF)
+        peak_memory_bytes = rusage.ru_maxrss
+        if platform.system() == "Linux":
+            peak_memory_bytes *= 1024
+        return peak_memory_bytes / (1024 * 1024)
+    return 0.0
+
+# --- 新增：阶段内存监控类（与C++脚本的PeakMemoryMonitor对齐） ---
+class PeakMemoryMonitor:
+    """
+    监控特定阶段的峰值内存使用量，与C++脚本的PeakMemoryMonitor类对齐。
+    使用 /proc/self/status 读取 VmRSS，与C++脚本的监测方式一致。
+    """
+    def __init__(self):
+        self.start_memory_mb = 0.0
+        self.peak_memory_mb = 0.0
+        self.monitoring = False
+    
+    def start(self):
+        """开始监控，记录起始内存"""
+        self.start_memory_mb = get_current_memory_mb()
+        self.peak_memory_mb = self.start_memory_mb
+        self.monitoring = True
+    
+    def update(self):
+        """更新峰值内存记录"""
+        if self.monitoring:
+            current_memory = get_current_memory_mb()
+            self.peak_memory_mb = max(self.peak_memory_mb, current_memory)
+    
+    def get_peak_memory_mb(self):
+        """获取监控期间的峰值内存（MB）"""
+        return self.peak_memory_mb
+    
+    def get_memory_increase(self):
+        """获取内存增长量（MB）"""
+        return self.peak_memory_mb - self.start_memory_mb
+    
+    def stop(self):
+        """停止监控"""
+        self.monitoring = False
+
 def report_peak_memory():
     """报告程序运行期间的峰值内存占用。"""
     print("\n" + "="*60); print("Phase 6: 性能报告")
     if platform.system() in ["Linux", "Darwin"]:
+        # 方法1: 使用resource.getrusage (整个程序生命周期的峰值)
         peak_memory_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         if platform.system() == "Linux": peak_memory_bytes *= 1024
         peak_memory_mb = peak_memory_bytes / (1024 * 1024)
-        print(f"整个程序运行期间的峰值内存占用: {peak_memory_mb:.2f} MB")
+        print(f"整个程序运行期间的峰值内存占用 (ru_maxrss): {peak_memory_mb:.2f} MB")
+        
+        # 方法2: 使用/proc/self/status (当前RSS，仅作参考)
+        current_memory_mb = get_current_memory_mb()
+        print(f"程序结束时的当前内存占用 (VmRSS): {current_memory_mb:.2f} MB")
     else:
         print("无法在当前操作系统上自动获取峰值内存。")
     print("="*60)
@@ -156,7 +224,7 @@ print("="*60)
 # HNSW 核心参数
 M = 32              # 图中每个节点的邻居数(度)。控制索引的质量和内存占用。
 efConstruction = 200 # 构建图时的搜索范围。影响构建时间和索引质量。
-efSearch = 100       # 搜索时的搜索范围。影响搜索时间和召回率。
+efSearch = 200       # 搜索时的搜索范围。影响搜索时间和召回率。
 k = 10              # k-NN搜索中的k值
 
 # --- 修改部分：根据参数生成索引文件名 ---
@@ -210,6 +278,15 @@ else:
     print(f"   -> 索引保存完成，耗时: {end_save_time - start_save_time:.2f} 秒")
 
 print(f"索引中的向量总数 (ntotal): {index_hnsw.ntotal}")
+
+# --- 新增：释放基础数据集以与C++脚本对齐 ---
+# C++脚本在索引构建后，基础数据集会超出作用域自动释放
+# 为了公平对比，我们在索引构建/加载完成后也释放基础数据集
+print("\n  -> 释放基础数据集以节省内存（与C++脚本对齐）...")
+del xb
+import gc
+gc.collect()  # 强制垃圾回收以立即释放内存
+print("  -> 基础数据集已释放")
 print("="*60)
 
 # ==============================================================================
@@ -222,6 +299,23 @@ print(f"HNSW efSearch (搜索参数): {efSearch}")
 # 设置搜索时参数 (efSearch值越高，搜索越慢，但召回率越高)
 index_hnsw.hnsw.efSearch = efSearch
 
+# --- 新增：开始监控搜索阶段的峰值内存（与C++脚本对齐） ---
+# 注意：此时基础数据集已释放，为了与C++完全对齐，我们也释放查询数据
+# C++脚本在搜索监控开始后才加载查询数据，我们也要这样做
+print("  -> 临时释放查询数据集（将在监控开始后重新加载，与C++对齐）...")
+del xq
+gc.collect()
+search_memory_monitor = PeakMemoryMonitor()
+search_memory_monitor.start()
+search_memory_monitor.update()  # 记录搜索开始前的内存状态（不包含查询数据）
+
+# 在监控开始后重新加载查询数据（与C++脚本一致）
+print("  -> 在搜索监控开始后加载查询数据（与C++对齐）...")
+xq, nq_reload, d_query_reload = read_fbin(QUERY_FILE)
+search_memory_monitor.update()  # 更新内存状态（包含查询数据）
+if nq != nq_reload or d_query != d_query_reload:
+    raise ValueError(f"重新加载的查询数据不匹配!")
+
 print("   -> 执行搜索...")
 # --- 修改部分：同时记录墙上时钟时间和CPU时间 ---
 start_search_wall_time = time.time()
@@ -232,6 +326,10 @@ D, I = index_hnsw.search(xq, k)
 end_search_cpu_time = get_cpu_time()
 end_search_wall_time = time.time()
 # --- 结束修改 ---
+
+# 更新搜索完成后的内存状态
+search_memory_monitor.update()
+search_memory_monitor.stop()
 
 wall_time_diff = end_search_wall_time - start_search_wall_time
 cpu_time_diff = end_search_cpu_time - start_search_cpu_time
@@ -244,6 +342,9 @@ print(f"      - 墙上时钟 (Wall-clock) 耗时: {wall_time_diff:.2f} 秒")
 print(f"      - CPU 耗时 (User + System): {cpu_time_diff:.2f} 秒")
 print(f"   -> 每秒查询数 (QPS, 基于墙上时钟): {qps_wall:.2f}")
 print(f"   -> 每秒查询数 (QPS, 基于CPU时间):  {qps_cpu:.2f}")
+# --- 新增：报告搜索阶段的峰值内存（与C++脚本对齐） ---
+print(f"   -> 搜索阶段峰值内存 (VmRSS, 与C++对齐): {search_memory_monitor.get_peak_memory_mb():.2f} MB")
+print(f"   -> 搜索阶段内存增长: {search_memory_monitor.get_memory_increase():.2f} MB")
 print("="*60)
 
 # ==============================================================================

@@ -465,6 +465,72 @@ struct IndexIVF : Index, IndexIVFInterface {
     /// replace the inverted lists, old one is deallocated if own_invlists
     void replace_invlists(InvertedLists* il, bool own = false);
 
+    /** Dynamic cluster maintenance functions
+     * These functions help maintain the quality of the IVF index after
+     * insertions, updates, and deletions.
+     */
+
+    /** Recompute centroids from current vectors in inverted lists
+     *
+     * Recalculates the centroid for each cluster based on the vectors
+     * currently stored in the corresponding inverted list.
+     *
+     * @param update_quantizer  if true, update the quantizer with new centroids
+     * @return number of centroids updated
+     */
+    size_t recompute_centroids(bool update_quantizer = true);
+
+    /** Split large clusters into smaller ones
+     *
+     * Identifies clusters with size > threshold and splits them into
+     * multiple sub-clusters using k-means.
+     *
+     * @param size_threshold    minimum cluster size to trigger split
+     * @param split_factor      number of sub-clusters to create (default: 2)
+     * @param min_split_size    minimum size required for splitting (default: 100)
+     * @return number of clusters split
+     */
+    size_t split_large_clusters(
+            size_t size_threshold,
+            int split_factor = 2,
+            size_t min_split_size = 100);
+
+    /** Merge small clusters into nearby clusters
+     *
+     * Identifies clusters with size < threshold and merges them into
+     * the nearest cluster.
+     *
+     * @param size_threshold    maximum cluster size to trigger merge
+     * @param min_merge_size    minimum size difference to merge (default: 1)
+     * @return number of clusters merged
+     */
+    size_t merge_small_clusters(
+            size_t size_threshold,
+            size_t min_merge_size = 1);
+
+    /** Comprehensive cluster maintenance
+     *
+     * Performs all maintenance operations: recompute centroids, split large
+     * clusters, and merge small clusters.
+     *
+     * @param split_threshold   cluster size threshold for splitting
+     * @param merge_threshold   cluster size threshold for merging
+     * @param split_factor      number of sub-clusters when splitting
+     * @param update_quantizer  if true, update quantizer after operations
+     * @return struct containing statistics about the maintenance operations
+     */
+    struct ClusterMaintenanceStats {
+        size_t centroids_recomputed = 0;
+        size_t clusters_split = 0;
+        size_t clusters_merged = 0;
+        size_t new_nlist = 0;
+    };
+    ClusterMaintenanceStats maintain_clusters(
+            size_t split_threshold,
+            size_t merge_threshold,
+            int split_factor = 2,
+            bool update_quantizer = true);
+
     /* The standalone codec interface (except sa_decode that is specific) */
     size_t sa_code_size() const override;
 

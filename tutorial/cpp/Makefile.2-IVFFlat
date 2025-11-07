@@ -1,0 +1,26 @@
+CXX = g++
+CXXFLAGS = -std=c++17 -O3 -fopenmp -march=native -Wall -Wextra
+INCLUDES = -I../.. -I..
+LDFLAGS = -L../../build/faiss -Wl,-rpath,../../build/faiss -lfaiss -lopenblas -fopenmp
+
+# 目标文件
+TARGET = 2-IVFFlat
+SOURCES = 2-IVFFlat.cpp
+
+# 默认目标
+all: $(TARGET)
+
+# 编译 2-IVFFlat 程序
+$(TARGET): $(SOURCES)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $(TARGET) $(SOURCES) $(LDFLAGS)
+
+# 运行程序
+run: $(TARGET)
+	./$(TARGET)
+
+# 清理
+clean:
+	rm -f $(TARGET) *.o
+
+.PHONY: all run clean
+
