@@ -232,3 +232,6 @@ vector<vector<int32_t>> groundtruth = read_ivecs(GROUNDTRUTH_FILE);
 
 **结论**：`benchmark_ivf_ondisk.cpp` 的内存管理已经很好，主要的内存占用来自量化器和访问的倒排列表，这是 mmap 的正常行为。
 
+
+
+

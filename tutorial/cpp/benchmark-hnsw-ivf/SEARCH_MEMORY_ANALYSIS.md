@@ -174,3 +174,6 @@ faiss::Index* index = faiss::read_index(index_filename.c_str(), IO_FLAG_MMAP);
 - 这是**系统级行为**，无法完全避免
 - 如果需要严格控制内存，需要考虑其他方案（如更小的nprobe、分片索引等）
 
+
+
+
