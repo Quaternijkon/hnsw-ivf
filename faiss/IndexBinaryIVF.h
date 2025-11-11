@@ -93,7 +93,9 @@ struct IndexBinaryIVF : IndexBinary {
             idx_t n,
             const uint8_t* x,
             const idx_t* xids,
-            const idx_t* precomputed_idx);
+            const idx_t* precomputed_idx,
+            void* inverted_list_context = nullptr,
+            bool auto_maintain = true);
 
     /** Search a set of vectors, that are pre-quantized by the IVF
      *  quantizer. Fill in the corresponding heaps with the query

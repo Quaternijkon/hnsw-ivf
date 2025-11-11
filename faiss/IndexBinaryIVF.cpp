@@ -53,7 +53,9 @@ void IndexBinaryIVF::add_core(
         idx_t n,
         const uint8_t* x,
         const idx_t* xids,
-        const idx_t* precomputed_idx) {
+        const idx_t* precomputed_idx,
+        void* inverted_list_context,
+        bool auto_maintain) {
     FAISS_THROW_IF_NOT(is_trained);
     assert(invlists);
     direct_map.check_can_add(xids);

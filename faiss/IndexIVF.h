@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <faiss/Clustering.h>
@@ -241,7 +242,8 @@ struct IndexIVF : Index, IndexIVFInterface {
             const float* x,
             const idx_t* xids,
             const idx_t* precomputed_idx,
-            void* inverted_list_context = nullptr);
+            void* inverted_list_context = nullptr,
+            bool auto_maintain = true);
 
     /** Encodes a set of vectors as they would appear in the inverted lists
      *
@@ -529,6 +531,50 @@ struct IndexIVF : Index, IndexIVFInterface {
             size_t split_threshold,
             size_t merge_threshold,
             int split_factor = 2,
+            bool update_quantizer = true);
+
+    /** Per-cluster maintenance functions
+     * These functions maintain only specific clusters, not all clusters.
+     * Used for incremental maintenance after insert/delete/update operations.
+     */
+
+    /** Recompute centroid for a specific cluster
+     *
+     * @param list_no           cluster index to recompute
+     * @param update_quantizer  if true, update the quantizer with new centroid
+     * @return true if centroid was recomputed
+     */
+    bool recompute_cluster_centroid(size_t list_no, bool update_quantizer = true);
+
+    /** Check and maintain a specific cluster
+     *
+     * Checks cluster size and performs split/merge/recompute as needed.
+     * Only maintains the specified cluster, not others.
+     *
+     * @param list_no           cluster index to maintain
+     * @param split_threshold   cluster size threshold for splitting
+     * @param merge_threshold   cluster size threshold for merging
+     * @param split_factor      number of sub-clusters when splitting
+     * @param update_quantizer  if true, update quantizer after operations
+     * @return struct containing statistics about the maintenance operations
+     */
+    ClusterMaintenanceStats maintain_cluster(
+            size_t list_no,
+            size_t split_threshold,
+            size_t merge_threshold,
+            int split_factor = 2,
+            bool update_quantizer = true);
+
+    /** Maintain clusters affected by insert/delete/update operations
+     *
+     * Automatically called after insert/delete/update to maintain affected clusters.
+     * Uses default thresholds based on average cluster size.
+     *
+     * @param affected_clusters set of cluster indices that were affected
+     * @param update_quantizer  if true, update quantizer after operations
+     */
+    void maintain_affected_clusters(
+            const std::unordered_set<size_t>& affected_clusters,
             bool update_quantizer = true);
 
     /* The standalone codec interface (except sa_decode that is specific) */

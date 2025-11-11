@@ -209,7 +209,8 @@ void IndexIVFScalarQuantizer::add_core(
         const float* x,
         const idx_t* xids,
         const idx_t* coarse_idx,
-        void* inverted_list_context) {
+        void* inverted_list_context,
+        bool auto_maintain) {
     FAISS_THROW_IF_NOT(is_trained);
 
     std::unique_ptr<ScalarQuantizer::SQuantizer> squant(sq.select_quantizer());

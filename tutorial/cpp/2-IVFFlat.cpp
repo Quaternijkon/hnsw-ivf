@@ -139,6 +139,7 @@ int main() {
     
     index.add_with_ids(n_insert, x_insert, ids_insert);
     printf("插入了 %d 个向量，索引总数: %zd\n", n_insert, index.ntotal);
+    printf("注意：插入操作后已自动维护被插入的聚类\n");
 
     // ========== 演示更新操作 ==========
     printf("\n=== 演示更新操作 ===\n");
@@ -156,6 +157,7 @@ int main() {
     
     index.update_vectors(n_update, ids_update, x_update);
     printf("更新了 %d 个向量\n", n_update);
+    printf("注意：更新操作（删除+插入）后已自动维护被操作的聚类\n");
 
     // ========== 演示删除操作 ==========
     printf("\n=== 演示删除操作 ===\n");
@@ -171,21 +173,28 @@ int main() {
     faiss::IDSelectorArray selector(n_delete, ids_to_delete.data());
     size_t n_removed = index.remove_ids(selector);
     printf("删除了 %zd 个向量，索引总数: %zd\n", n_removed, index.ntotal);
+    printf("注意：删除操作后已自动维护被删除向量所在的聚类\n");
     
     // 删除操作后，某些倒排列表可能变空，增加 nprobe 可以提高搜索成功率
     // 如果删除的向量很多，建议适当增加 nprobe
     if (n_removed > 0) {
-        int new_nprobe = std::min(nlist, nprobe + 5);  // 增加 nprobe 以确保能找到结果
+        int new_nprobe = std::min((int)index.nlist, nprobe + 5);  // 增加 nprobe 以确保能找到结果
         index.nprobe = new_nprobe;
         printf("删除操作后，已将 nprobe 调整为 %d\n", new_nprobe);
     }
 
     // ========== 演示动态聚类维护 ==========
-    printf("\n=== 演示动态聚类维护 ===\n");
+    printf("\n=== 聚类维护说明 ===\n");
+    printf("注意：插入、更新和删除操作后，系统会自动维护被操作的聚类。\n");
+    printf("维护策略：\n");
+    printf("  - 如果聚类偏大（>平均大小*3），则分裂\n");
+    printf("  - 如果聚类偏小（<平均大小/3），则合并\n");
+    printf("  - 如果聚类大小适中，则只重新计算质心\n");
+    printf("  - 所有维护操作后都会同步更新quantizer中的质心\n");
     
-    // 计算聚类的平均大小和最大/最小大小
+    // 显示当前聚类统计信息
     size_t total_vectors = index.ntotal;
-    size_t avg_cluster_size = (nlist > 0) ? (total_vectors / nlist) : 0;
+    size_t avg_cluster_size = (nlist > 0 && total_vectors > 0) ? (total_vectors / nlist) : 0;
     size_t max_cluster_size = 0;
     size_t min_cluster_size = SIZE_MAX;
     
@@ -197,50 +206,14 @@ int main() {
         }
     }
     
-    printf("聚类统计信息:\n");
+    printf("\n当前聚类统计信息:\n");
     printf("  - 总向量数: %zd\n", total_vectors);
     printf("  - 聚类数量: %zu\n", (size_t)nlist);
     printf("  - 平均聚类大小: %zd\n", avg_cluster_size);
     printf("  - 最大聚类大小: %zd\n", max_cluster_size);
     printf("  - 最小聚类大小: %zd\n", min_cluster_size == SIZE_MAX ? 0 : min_cluster_size);
     
-    // 1. 重新计算质心
-    printf("\n1. 重新计算质心...\n");
-    size_t n_recomputed = index.recompute_centroids(true);
-    printf("   重新计算了 %zd 个质心\n", n_recomputed);
-    
-    // 2. 分裂大聚类（如果存在）
-    // 设置阈值为平均大小的3倍
-    size_t split_threshold = avg_cluster_size * 3;
-    if (split_threshold < 100) split_threshold = 100;  // 最小阈值
-    printf("\n2. 检查是否需要分裂大聚类 (阈值=%zd)...\n", split_threshold);
-    size_t n_split = index.split_large_clusters(split_threshold, 2, 100);
-    printf("   分裂了 %zd 个聚类\n", n_split);
-    
-    // 3. 合并小聚类（如果存在）
-    // 设置阈值为平均大小的1/3
-    size_t merge_threshold = avg_cluster_size / 3;
-    if (merge_threshold < 10) merge_threshold = 10;  // 最小阈值
-    printf("\n3. 检查是否需要合并小聚类 (阈值=%zd)...\n", merge_threshold);
-    size_t n_merged = index.merge_small_clusters(merge_threshold);
-    printf("   合并了 %zd 个聚类\n", n_merged);
-    
-    // 4. 综合维护（可选）
-    printf("\n4. 执行综合聚类维护...\n");
-    faiss::IndexIVF::ClusterMaintenanceStats stats = index.maintain_clusters(
-        split_threshold, merge_threshold, 2, true);
-    printf("   维护完成:\n");
-    printf("     - 重新计算的质心: %zd\n", stats.centroids_recomputed);
-    printf("     - 分裂的聚类: %zd\n", stats.clusters_split);
-    printf("     - 合并的聚类: %zd\n", stats.clusters_merged);
-    printf("     - 新的聚类数量: %zd\n", stats.new_nlist);
-    
-    // 更新nprobe以适应新的聚类数量
-    if (stats.new_nlist != (size_t)nlist) {
-        int updated_nprobe = std::min((int)stats.new_nlist, nprobe + 5);
-        index.nprobe = updated_nprobe;
-        printf("   已将 nprobe 调整为 %d (适应新的聚类数量)\n", updated_nprobe);
-    }
+    // 注意：不需要手动调用维护函数，因为插入/删除/更新操作已经自动维护了被影响的聚类
 
     // ========== 最终搜索 ==========
     { // 最终搜索

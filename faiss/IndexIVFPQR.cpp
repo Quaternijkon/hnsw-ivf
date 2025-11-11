@@ -92,7 +92,8 @@ void IndexIVFPQR::add_core(
         const float* x,
         const idx_t* xids,
         const idx_t* precomputed_idx,
-        void* /*inverted_list_context*/) {
+        void* /*inverted_list_context*/,
+        bool auto_maintain) {
     std::unique_ptr<float[]> residual_2(new float[n * d]);
 
     idx_t n0 = ntotal;

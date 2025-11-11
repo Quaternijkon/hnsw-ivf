@@ -72,7 +72,8 @@ struct IndexIVFPQ : IndexIVF {
             const float* x,
             const idx_t* xids,
             const idx_t* precomputed_idx,
-            void* inverted_list_context = nullptr) override;
+            void* inverted_list_context = nullptr,
+            bool auto_maintain = true) override;
 
     /// same as add_core, also:
     /// - output 2nd level residuals if residuals_2 != NULL
