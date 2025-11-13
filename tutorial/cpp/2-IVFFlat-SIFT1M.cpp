@@ -16,10 +16,11 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
-#include <random>
+#include <cstring>
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <numeric>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <omp.h>
@@ -149,19 +150,6 @@ int main(int argc, char* argv[]) {
     printf("  搜索探查数 (nprobe): %d\n", nprobe);
     printf("  返回结果数 (k): %d\n", k);
     
-    // ========== 训练索引 ==========
-    printf("\n[%.3f s] 训练索引...\n", elapsed() - t0);
-    assert(!index.is_trained);
-    index.train(nt, xt);
-    assert(index.is_trained);
-    printf("  训练完成\n");
-    delete[] xt;
-    
-    // ========== 启用 direct_map ==========
-    index.set_direct_map_type(faiss::DirectMap::Hashtable);
-    index.nprobe = nprobe;
-    printf("\n[%.3f s] 已启用 direct_map (Hashtable 类型)\n", elapsed() - t0);
-    
     // ========== 加载数据库 ==========
     printf("\n[%.3f s] 加载数据库...\n", elapsed() - t0);
     size_t nb, d2;
@@ -169,15 +157,58 @@ int main(int argc, char* argv[]) {
     assert(d == d2 || !"数据库维度与训练集不一致");
     printf("  数据库向量数: %zd\n", nb);
     
+    // ========== 训练索引 ==========
+    printf("\n[%.3f s] 训练索引...\n", elapsed() - t0);
+    assert(!index.is_trained);
+    size_t min_training = std::max<size_t>(nlist * 40, nt);
+    std::vector<float> training_vectors;
+    training_vectors.reserve((nt + min_training) * d);
+    training_vectors.insert(training_vectors.end(), xt, xt + nt * d);
+    if (nt < min_training) {
+        size_t need = std::min(nb, min_training - nt);
+        training_vectors.insert(
+                training_vectors.end(),
+                xb,
+                xb + need * d);
+        printf("  训练集不足，额外使用 %zu 条数据库向量增强。\n", need);
+    }
+    size_t training_count = training_vectors.size() / d;
+    index.train(training_count, training_vectors.data());
+    assert(index.is_trained);
+    printf("  训练完成，共使用 %zu 条向量\n", training_count);
+    delete[] xt;
+    
+    // ========== 启用 direct_map ==========
+    index.set_direct_map_type(faiss::DirectMap::Hashtable);
+    index.nprobe = nprobe;
+    printf("\n[%.3f s] 已启用 direct_map (Hashtable 类型)\n", elapsed() - t0);
+    
+    // ========== 设定操作规模 ==========
+    constexpr size_t kInitialTarget = 800000;
+    constexpr size_t kInsertTarget = 100000;
+    constexpr size_t kDeleteTarget = 100000;
+    constexpr size_t kUpdateTarget = 100000;
+    constexpr size_t kUpdateTargetStartId = 100000;
+    constexpr size_t kUpdateSourceStart = 900000;
+    
+    if (nb < kUpdateSourceStart + kUpdateTarget) {
+        printf("  警告：数据库向量不足 100 万（nb=%zu），无法完全覆盖预期流程。\n", nb);
+    }
+    
     // ========== 初始添加数据 ==========
     printf("\n[%.3f s] 初始添加数据...\n", elapsed() - t0);
-    idx_t* ids_initial = new idx_t[nb];
-    for (size_t i = 0; i < nb; i++) {
-        ids_initial[i] = i;
+    size_t n_initial = std::min(kInitialTarget, nb);
+    if (n_initial == 0) {
+        fprintf(stderr, "错误: 数据库向量数为 0，无法构建索引。\n");
+        return 1;
     }
-    index.add_with_ids(nb, xb, ids_initial);
-    printf("  已添加 %zd 个向量，索引总数: %zd\n", nb, index.ntotal);
-    delete[] ids_initial;
+    std::vector<idx_t> ids_initial(n_initial);
+    std::iota(ids_initial.begin(), ids_initial.end(), 0);
+    index.add_with_ids(n_initial, xb, ids_initial.data());
+    printf("  初始添加 %zd 个向量（目标 %zu），索引总数: %zd\n",
+           n_initial,
+           kInitialTarget,
+           index.ntotal);
     
     // ========== 加载查询集和 groundtruth ==========
     printf("\n[%.3f s] 加载查询集...\n", elapsed() - t0);
@@ -216,69 +247,120 @@ int main(int argc, char* argv[]) {
     
     // ========== 演示插入操作 ==========
     printf("\n[%.3f s] ========== 演示插入操作 ==========\n", elapsed() - t0);
-    size_t n_insert = 10000;  // 插入 1% 的数据
-    float* x_insert = new float[d * n_insert];
-    idx_t* ids_insert = new idx_t[n_insert];
-    
-    // 从数据库中选择一些向量作为插入数据（模拟新数据）
-    std::mt19937 rng(42);
-    std::uniform_int_distribution<size_t> distrib(0, nb - 1);
-    for (size_t i = 0; i < n_insert; i++) {
-        size_t src_idx = distrib(rng);
-        memcpy(x_insert + i * d, xb + src_idx * d, d * sizeof(float));
-        ids_insert[i] = nb + i;  // 使用新的 ID
+    size_t n_insert = (nb > n_initial)
+            ? std::min(kInsertTarget, nb - n_initial)
+            : 0;
+    double insert_time = 0.0;
+    if (n_insert > 0) {
+        std::vector<idx_t> ids_insert(n_insert);
+        std::iota(ids_insert.begin(), ids_insert.end(), n_initial);
+        const float* xb_insert = xb + n_initial * d;
+        
+        double insert_t0 = elapsed();
+        index.add_with_ids(n_insert, xb_insert, ids_insert.data());
+        insert_time = elapsed() - insert_t0;
+        
+        printf("  插入了 %zd 个向量，索引总数: %zd\n", n_insert, index.ntotal);
+        printf("  插入时间: %.3f s\n", insert_time);
+        printf("  注意：插入操作后已自动维护被插入的聚类\n");
+    } else {
+        printf("  没有可插入的数据，跳过插入演示。\n");
     }
-    
-    double insert_t0 = elapsed();
-    index.add_with_ids(n_insert, x_insert, ids_insert);
-    double insert_time = elapsed() - insert_t0;
-    
-    printf("  插入了 %zd 个向量，索引总数: %zd\n", n_insert, index.ntotal);
-    printf("  插入时间: %.3f s\n", insert_time);
-    printf("  注意：插入操作后已自动维护被插入的聚类\n");
-    
-    // ========== 演示更新操作 ==========
-    printf("\n[%.3f s] ========== 演示更新操作 ==========\n", elapsed() - t0);
-    size_t n_update = 10000;  // 更新 1% 的数据
-    float* x_update = new float[d * n_update];
-    idx_t* ids_update = new idx_t[n_update];
-    
-    // 选择要更新的向量（选择前 n_update 个）
-    for (size_t i = 0; i < n_update; i++) {
-        ids_update[i] = i;
-        // 生成新的向量值（添加一些噪声）
-        memcpy(x_update + i * d, xb + i * d, d * sizeof(float));
-        for (size_t j = 0; j < d; j++) {
-            x_update[i * d + j] += (rng() % 100) / 10000.0f;  // 添加小噪声
-        }
-    }
-    
-    double update_t0 = elapsed();
-    index.update_vectors(n_update, ids_update, x_update);
-    double update_time = elapsed() - update_t0;
-    
-    printf("  更新了 %zd 个向量\n", n_update);
-    printf("  更新时间: %.3f s\n", update_time);
-    printf("  注意：更新操作（删除+插入）后已自动维护被操作的聚类\n");
     
     // ========== 演示删除操作 ==========
     printf("\n[%.3f s] ========== 演示删除操作 ==========\n", elapsed() - t0);
-    size_t n_delete = 10000;  // 删除 1% 的数据
-    std::vector<idx_t> ids_to_delete(n_delete);
-    
-    // 选择要删除的向量 ID（选择 ID 为 50000 到 59999 的向量）
-    for (size_t i = 0; i < n_delete; i++) {
-        ids_to_delete[i] = 50000 + i;
+    size_t ntotal_before_delete = static_cast<size_t>(index.ntotal);
+    size_t n_delete = std::min(kDeleteTarget, ntotal_before_delete);
+    double delete_time = 0.0;
+    size_t n_removed = 0;
+    if (n_delete > 0) {
+        std::vector<idx_t> ids_to_delete(n_delete);
+        std::iota(ids_to_delete.begin(), ids_to_delete.end(), 0);
+
+        faiss::IDSelectorArray selector(n_delete, ids_to_delete.data());
+        double delete_t0 = elapsed();
+        n_removed = index.remove_ids(selector);
+        delete_time = elapsed() - delete_t0;
+        
+        printf("  删除了 %zd 个向量，索引总数: %zd\n", n_removed, index.ntotal);
+        printf("  删除时间: %.3f s\n", delete_time);
+        printf("  注意：删除操作后已自动维护被删除向量所在的聚类\n");
+    } else {
+        printf("  当前索引向量过少，跳过删除演示。\n");
     }
     
-    faiss::IDSelectorArray selector(n_delete, ids_to_delete.data());
-    double delete_t0 = elapsed();
-    size_t n_removed = index.remove_ids(selector);
-    double delete_time = elapsed() - delete_t0;
+    // ========== 演示更新操作 ==========
+    printf("\n[%.3f s] ========== 演示更新操作 ==========\n", elapsed() - t0);
+    size_t update_source_available =
+            (nb > kUpdateSourceStart) ? (nb - kUpdateSourceStart) : 0;
+    size_t ntotal_after_delete = static_cast<size_t>(index.ntotal);
+    size_t available_ids_for_update =
+            (ntotal_after_delete > kUpdateTargetStartId)
+            ? (ntotal_after_delete - kUpdateTargetStartId)
+            : 0;
+    available_ids_for_update = std::min(available_ids_for_update, kUpdateTarget);
+    size_t n_update = std::min(kUpdateTarget, update_source_available);
+    n_update = std::min(n_update, available_ids_for_update);
+    double update_time = 0.0;
+    if (n_update > 0) {
+        std::vector<idx_t> ids_update(n_update);
+        std::iota(ids_update.begin(), ids_update.end(), kUpdateTargetStartId);
+        std::vector<float> x_update(d * n_update);
+        const float* source_begin = xb + kUpdateSourceStart * d;
+        for (size_t i = 0; i < n_update; ++i) {
+            memcpy(
+                    x_update.data() + i * d,
+                    source_begin + i * d,
+                    d * sizeof(float));
+        }
+        double update_t0 = elapsed();
+        index.update_vectors(n_update, ids_update.data(), x_update.data());
+        update_time = elapsed() - update_t0;
+        
+        size_t update_id_end = kUpdateTargetStartId + n_update;
+        size_t update_source_end = kUpdateSourceStart + n_update;
+        printf("  更新了 %zd 个向量（ID [%zu, %zu) → 数据段 [%zu, %zu)）\n",
+               n_update,
+               kUpdateTargetStartId,
+               update_id_end,
+               kUpdateSourceStart,
+               update_source_end);
+        printf("  更新时间: %.3f s\n", update_time);
+        printf("  注意：更新操作（删除+插入）后已自动维护被操作的聚类\n");
+    } else {
+        printf("  可更新的向量数量不足，跳过更新演示。\n");
+    }
     
-    printf("  删除了 %zd 个向量，索引总数: %zd\n", n_removed, index.ntotal);
-    printf("  删除时间: %.3f s\n", delete_time);
-    printf("  注意：删除操作后已自动维护被删除向量所在的聚类\n");
+    size_t desired_final = n_initial + n_insert - n_removed;
+    if (index.ntotal < desired_final && desired_final > index.ntotal) {
+        size_t missing = desired_final - index.ntotal;
+        std::vector<idx_t> ids_reinsert(missing);
+        size_t fill = 0;
+        for (idx_t id = 0; id < (idx_t)(n_initial + n_insert) && fill < missing; ++id) {
+            if (index.direct_map.get(id) == -1) {
+                ids_reinsert[fill++] = id;
+            }
+        }
+        std::vector<float> x_reinsert(missing * d);
+        for (size_t i = 0; i < missing; ++i) {
+            idx_t id = ids_reinsert[i];
+            memcpy(
+                    x_reinsert.data() + i * d,
+                    xb + id * d,
+                    d * sizeof(float));
+        }
+        index.add_with_ids(missing, x_reinsert.data(), ids_reinsert.data());
+        printf("  补回 %zd 个原始向量，索引总数: %zd\n", missing, index.ntotal);
+    }
+    
+    size_t retained_base = 0;
+    for (idx_t id = 0; id < (idx_t)nb; ++id) {
+        if (index.direct_map.get(id) != -1) {
+            retained_base++;
+        }
+    }
+    double retained_ratio = nb > 0 ? (retained_base * 100.0 / nb) : 0.0;
+    printf("  原始 SIFT1M 数据保留量: %zd (占比 %.2f%%)\n", retained_base, retained_ratio);
     
     // 删除操作后，某些倒排列表可能变空，增加 nprobe 可以提高搜索成功率
     // ========== 显示聚类统计信息 ==========
@@ -356,10 +438,6 @@ int main(int argc, char* argv[]) {
     printf("    ✓ 索引质量保持稳定（Recall 变化较小）\n");
     
     // 清理内存
-    delete[] x_insert;
-    delete[] ids_insert;
-    delete[] x_update;
-    delete[] ids_update;
     delete[] xb;
     delete[] xq;
     delete[] gt;
