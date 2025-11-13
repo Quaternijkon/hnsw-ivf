@@ -565,9 +565,6 @@ struct IndexIVF : Index, IndexIVFInterface {
             int split_factor = 2,
             bool update_quantizer = true);
 
-    /// LIRE-style refinement of clusters after structural changes
-    void lire_refine_clusters(const std::vector<size_t>& seed_clusters);
-
     /** Maintain clusters affected by insert/delete/update operations
      *
      * Automatically called after insert/delete/update to maintain affected clusters.
@@ -579,12 +576,6 @@ struct IndexIVF : Index, IndexIVFInterface {
     void maintain_affected_clusters(
             const std::unordered_set<size_t>& affected_clusters,
             bool update_quantizer = true);
-
-    /// Helper to expand cluster neighborhood during refinement
-    void append_neighbor_clusters(
-            std::unordered_set<size_t>& clusters,
-            size_t base_cluster,
-            size_t max_neighbors) const;
 
     /* The standalone codec interface (except sa_decode that is specific) */
     size_t sa_code_size() const override;
