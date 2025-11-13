@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <atomic>
+#include <unordered_map>
 
 #include <algorithm>
 #include <cinttypes>
@@ -2159,12 +2160,14 @@ size_t IndexIVF::split_large_clusters(
         std::vector<float> cluster_vectors(list_size * d);
         std::vector<idx_t> cluster_ids(list_size);
         
-        InvertedLists::ScopedCodes codes(invlists, list_no);
-        InvertedLists::ScopedIds ids(invlists, list_no);
-        
-        for (size_t offset = 0; offset < list_size; offset++) {
-            cluster_ids[offset] = ids[offset];
-            reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+        {
+            InvertedLists::ScopedCodes codes(invlists, list_no);
+            InvertedLists::ScopedIds ids(invlists, list_no);
+            
+            for (size_t offset = 0; offset < list_size; offset++) {
+                cluster_ids[offset] = ids[offset];
+                reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+            }
         }
         
         // 2. 使用k-means将聚类分裂成split_factor个子聚类
@@ -2543,17 +2546,41 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
             printf("IndexIVF::maintain_cluster: splitting cluster %zd (size=%zd > threshold=%zd)\n",
                    list_no, list_size, split_threshold);
         }
+        size_t previous_nlist = nlist;
         
         // 获取该聚类的所有向量和ID
         std::vector<float> cluster_vectors(list_size * d);
         std::vector<idx_t> cluster_ids(list_size);
         
-        InvertedLists::ScopedCodes codes(invlists, list_no);
-        InvertedLists::ScopedIds ids(invlists, list_no);
-        
-        for (size_t offset = 0; offset < list_size; offset++) {
-            cluster_ids[offset] = ids[offset];
-            reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+        {
+            InvertedLists::ScopedCodes codes(invlists, list_no);
+            InvertedLists::ScopedIds ids(invlists, list_no);
+            
+            for (size_t offset = 0; offset < list_size; offset++) {
+                cluster_ids[offset] = ids[offset];
+                reconstruct_from_offset(
+                        list_no, offset, cluster_vectors.data() + offset * d);
+            }
+        }
+        {
+            InvertedLists::ScopedCodes codes(invlists, list_no);
+            InvertedLists::ScopedIds ids(invlists, list_no);
+            
+            for (size_t offset = 0; offset < list_size; offset++) {
+                cluster_ids[offset] = ids[offset];
+                reconstruct_from_offset(
+                        list_no, offset, cluster_vectors.data() + offset * d);
+            }
+        }
+        {
+            InvertedLists::ScopedCodes codes(invlists, list_no);
+            InvertedLists::ScopedIds ids(invlists, list_no);
+            
+            for (size_t offset = 0; offset < list_size; offset++) {
+                cluster_ids[offset] = ids[offset];
+                reconstruct_from_offset(
+                        list_no, offset, cluster_vectors.data() + offset * d);
+            }
         }
         
         // 使用k-means将聚类分裂成split_factor个子聚类
@@ -2659,6 +2686,15 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
         
         stats.clusters_split = 1;
         stats.new_nlist = nlist;
+
+        std::vector<size_t> refine_clusters;
+        if (list_no < nlist) {
+            refine_clusters.push_back(list_no);
+        }
+        for (size_t idx = previous_nlist; idx < nlist; ++idx) {
+            refine_clusters.push_back(idx);
+        }
+        lire_refine_clusters(refine_clusters);
         
         if (verbose) {
             printf("IndexIVF::maintain_cluster: split cluster %zd into %d sub-clusters\n", list_no, split_factor);
@@ -2762,8 +2798,12 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
                 std::vector<idx_t> forced_assign(list_size, nearest_list_no);
                 add_core(list_size, cluster_vectors.data(), cluster_ids.data(), forced_assign.data(), nullptr, false);
                 
-                // 重新计算被合并到的聚类的质心
-                recompute_cluster_centroid(nearest_list_no, update_quantizer);
+                std::vector<size_t> refine_clusters = {
+                        size_t(nearest_list_no)};
+                if (list_no < nlist) {
+                    refine_clusters.push_back(list_no);
+                }
+                lire_refine_clusters(refine_clusters);
                 
                 stats.clusters_merged = 1;
                 
@@ -2790,6 +2830,156 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
     }
     
     return stats;
+}
+
+void IndexIVF::append_neighbor_clusters(
+        std::unordered_set<size_t>& clusters,
+        size_t base_cluster,
+        size_t max_neighbors) const {
+    if (!quantizer || !is_trained) {
+        return;
+    }
+    if (base_cluster >= nlist || quantizer->ntotal != nlist) {
+        return;
+    }
+    if (max_neighbors == 0) {
+        clusters.insert(base_cluster);
+        return;
+    }
+    std::vector<float> centroid(d);
+    try {
+        quantizer->reconstruct(base_cluster, centroid.data());
+    } catch (...) {
+        return;
+    }
+
+    clusters.insert(base_cluster);
+    size_t k = std::min(max_neighbors + 1, nlist);
+    std::vector<idx_t> labels(k);
+    std::vector<float> distances(k);
+    try {
+        quantizer->search(1, centroid.data(), k, distances.data(), labels.data());
+    } catch (...) {
+        return;
+    }
+    for (size_t i = 0; i < k; ++i) {
+        idx_t lbl = labels[i];
+        if (lbl >= 0 && (size_t)lbl < nlist) {
+            clusters.insert((size_t)lbl);
+        }
+    }
+}
+
+void IndexIVF::lire_refine_clusters(const std::vector<size_t>& seed_clusters) {
+    if (seed_clusters.empty()) {
+        return;
+    }
+    if (!is_trained || quantizer == nullptr) {
+        return;
+    }
+    if (quantizer->ntotal != nlist) {
+        return;
+    }
+
+    std::unordered_set<size_t> cluster_set;
+    cluster_set.reserve(seed_clusters.size() * 2);
+    for (size_t c : seed_clusters) {
+        if (c < nlist) {
+            cluster_set.insert(c);
+        }
+    }
+    if (cluster_set.empty()) {
+        return;
+    }
+
+    size_t neighbor_k =
+            std::min<size_t>(8, nlist > 0 ? nlist - 1 : 0);
+    if (neighbor_k > 0) {
+        std::vector<size_t> seeds(seed_clusters.begin(), seed_clusters.end());
+        for (size_t c : seeds) {
+            append_neighbor_clusters(cluster_set, c, neighbor_k);
+        }
+    }
+
+    std::unordered_map<size_t, std::vector<idx_t>> removal_ids;
+    std::unordered_map<size_t, std::vector<float>> add_vectors;
+    std::unordered_map<size_t, std::vector<idx_t>> add_ids;
+    std::unordered_set<size_t> clusters_to_recompute;
+    std::vector<float> vec(d);
+
+    for (size_t cluster : cluster_set) {
+        if (cluster >= nlist) {
+            continue;
+        }
+        size_t list_size = invlists->list_size(cluster);
+        if (list_size == 0) {
+            continue;
+        }
+
+        ScopedIds ids(invlists, cluster);
+        for (size_t offset = 0; offset < list_size; ++offset) {
+            idx_t id = ids[offset];
+            if (id < 0) {
+                continue;
+            }
+            try {
+                reconstruct_from_offset(cluster, offset, vec.data());
+            } catch (...) {
+                continue;
+            }
+            idx_t best = -1;
+            try {
+                quantizer->assign(1, vec.data(), &best);
+            } catch (...) {
+                continue;
+            }
+            if (best < 0 || (size_t)best >= nlist) {
+                continue;
+            }
+            size_t dest = (size_t)best;
+            if (dest == cluster) {
+                continue;
+            }
+            removal_ids[cluster].push_back(id);
+            add_ids[dest].push_back(id);
+            auto& storage = add_vectors[dest];
+            storage.insert(storage.end(), vec.begin(), vec.end());
+            clusters_to_recompute.insert(cluster);
+            clusters_to_recompute.insert(dest);
+        }
+    }
+
+    if (removal_ids.empty()) {
+        return;
+    }
+
+    for (auto& kv : removal_ids) {
+        auto& ids = kv.second;
+        if (ids.empty()) {
+            continue;
+        }
+        IDSelectorArray sel(ids.size(), ids.data());
+        size_t removed = direct_map.remove_ids(sel, invlists);
+        ntotal -= removed;
+    }
+
+    for (auto& kv : add_vectors) {
+        size_t dest = kv.first;
+        auto& vecs = kv.second;
+        auto& ids = add_ids[dest];
+        size_t count = ids.size();
+        if (count == 0) {
+            continue;
+        }
+        std::vector<idx_t> coarse(count, dest);
+        add_core(count, vecs.data(), ids.data(), coarse.data(), nullptr, false);
+    }
+
+    for (size_t cluster : clusters_to_recompute) {
+        if (cluster < nlist) {
+            recompute_cluster_centroid(cluster, true);
+        }
+    }
 }
 
 void IndexIVF::maintain_affected_clusters(
