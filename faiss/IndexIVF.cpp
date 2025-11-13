@@ -14,6 +14,9 @@
 #include <memory>
 #include <mutex>
 #include <chrono>
+#include <cstdlib>
+#include <atomic>
+#include <unordered_map>
 
 #include <algorithm>
 #include <cinttypes>
@@ -2157,12 +2160,14 @@ size_t IndexIVF::split_large_clusters(
         std::vector<float> cluster_vectors(list_size * d);
         std::vector<idx_t> cluster_ids(list_size);
         
-        InvertedLists::ScopedCodes codes(invlists, list_no);
-        InvertedLists::ScopedIds ids(invlists, list_no);
-        
-        for (size_t offset = 0; offset < list_size; offset++) {
-            cluster_ids[offset] = ids[offset];
-            reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+        {
+            InvertedLists::ScopedCodes codes(invlists, list_no);
+            InvertedLists::ScopedIds ids(invlists, list_no);
+            
+            for (size_t offset = 0; offset < list_size; offset++) {
+                cluster_ids[offset] = ids[offset];
+                reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+            }
         }
         
         // 2. 使用k-means将聚类分裂成split_factor个子聚类
@@ -2541,17 +2546,41 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
             printf("IndexIVF::maintain_cluster: splitting cluster %zd (size=%zd > threshold=%zd)\n",
                    list_no, list_size, split_threshold);
         }
+        size_t previous_nlist = nlist;
         
         // 获取该聚类的所有向量和ID
         std::vector<float> cluster_vectors(list_size * d);
         std::vector<idx_t> cluster_ids(list_size);
         
-        InvertedLists::ScopedCodes codes(invlists, list_no);
-        InvertedLists::ScopedIds ids(invlists, list_no);
-        
-        for (size_t offset = 0; offset < list_size; offset++) {
-            cluster_ids[offset] = ids[offset];
-            reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+        {
+            InvertedLists::ScopedCodes codes(invlists, list_no);
+            InvertedLists::ScopedIds ids(invlists, list_no);
+            
+            for (size_t offset = 0; offset < list_size; offset++) {
+                cluster_ids[offset] = ids[offset];
+                reconstruct_from_offset(
+                        list_no, offset, cluster_vectors.data() + offset * d);
+            }
+        }
+        {
+            InvertedLists::ScopedCodes codes(invlists, list_no);
+            InvertedLists::ScopedIds ids(invlists, list_no);
+            
+            for (size_t offset = 0; offset < list_size; offset++) {
+                cluster_ids[offset] = ids[offset];
+                reconstruct_from_offset(
+                        list_no, offset, cluster_vectors.data() + offset * d);
+            }
+        }
+        {
+            InvertedLists::ScopedCodes codes(invlists, list_no);
+            InvertedLists::ScopedIds ids(invlists, list_no);
+            
+            for (size_t offset = 0; offset < list_size; offset++) {
+                cluster_ids[offset] = ids[offset];
+                reconstruct_from_offset(
+                        list_no, offset, cluster_vectors.data() + offset * d);
+            }
         }
         
         // 使用k-means将聚类分裂成split_factor个子聚类
@@ -2657,6 +2686,15 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
         
         stats.clusters_split = 1;
         stats.new_nlist = nlist;
+
+        std::vector<size_t> refine_clusters;
+        if (list_no < nlist) {
+            refine_clusters.push_back(list_no);
+        }
+        for (size_t idx = previous_nlist; idx < nlist; ++idx) {
+            refine_clusters.push_back(idx);
+        }
+        lire_refine_clusters(refine_clusters);
         
         if (verbose) {
             printf("IndexIVF::maintain_cluster: split cluster %zd into %d sub-clusters\n", list_no, split_factor);
@@ -2760,8 +2798,12 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
                 std::vector<idx_t> forced_assign(list_size, nearest_list_no);
                 add_core(list_size, cluster_vectors.data(), cluster_ids.data(), forced_assign.data(), nullptr, false);
                 
-                // 重新计算被合并到的聚类的质心
-                recompute_cluster_centroid(nearest_list_no, update_quantizer);
+                std::vector<size_t> refine_clusters = {
+                        size_t(nearest_list_no)};
+                if (list_no < nlist) {
+                    refine_clusters.push_back(list_no);
+                }
+                lire_refine_clusters(refine_clusters);
                 
                 stats.clusters_merged = 1;
                 
@@ -2790,56 +2832,283 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
     return stats;
 }
 
+void IndexIVF::append_neighbor_clusters(
+        std::unordered_set<size_t>& clusters,
+        size_t base_cluster,
+        size_t max_neighbors) const {
+    if (!quantizer || !is_trained) {
+        return;
+    }
+    if (base_cluster >= nlist || quantizer->ntotal != nlist) {
+        return;
+    }
+    if (max_neighbors == 0) {
+        clusters.insert(base_cluster);
+        return;
+    }
+    std::vector<float> centroid(d);
+    try {
+        quantizer->reconstruct(base_cluster, centroid.data());
+    } catch (...) {
+        return;
+    }
+
+    clusters.insert(base_cluster);
+    size_t k = std::min(max_neighbors + 1, nlist);
+    std::vector<idx_t> labels(k);
+    std::vector<float> distances(k);
+    try {
+        quantizer->search(1, centroid.data(), k, distances.data(), labels.data());
+    } catch (...) {
+        return;
+    }
+    for (size_t i = 0; i < k; ++i) {
+        idx_t lbl = labels[i];
+        if (lbl >= 0 && (size_t)lbl < nlist) {
+            clusters.insert((size_t)lbl);
+        }
+    }
+}
+
+void IndexIVF::lire_refine_clusters(const std::vector<size_t>& seed_clusters) {
+    if (seed_clusters.empty()) {
+        return;
+    }
+    if (!is_trained || quantizer == nullptr) {
+        return;
+    }
+    if (quantizer->ntotal != nlist) {
+        return;
+    }
+
+    std::unordered_set<size_t> cluster_set;
+    cluster_set.reserve(seed_clusters.size() * 2);
+    for (size_t c : seed_clusters) {
+        if (c < nlist) {
+            cluster_set.insert(c);
+        }
+    }
+    if (cluster_set.empty()) {
+        return;
+    }
+
+    size_t neighbor_k =
+            std::min<size_t>(8, nlist > 0 ? nlist - 1 : 0);
+    if (neighbor_k > 0) {
+        std::vector<size_t> seeds(seed_clusters.begin(), seed_clusters.end());
+        for (size_t c : seeds) {
+            append_neighbor_clusters(cluster_set, c, neighbor_k);
+        }
+    }
+
+    std::unordered_map<size_t, std::vector<idx_t>> removal_ids;
+    std::unordered_map<size_t, std::vector<float>> add_vectors;
+    std::unordered_map<size_t, std::vector<idx_t>> add_ids;
+    std::unordered_set<size_t> clusters_to_recompute;
+    std::vector<float> vec(d);
+
+    for (size_t cluster : cluster_set) {
+        if (cluster >= nlist) {
+            continue;
+        }
+        size_t list_size = invlists->list_size(cluster);
+        if (list_size == 0) {
+            continue;
+        }
+
+        ScopedIds ids(invlists, cluster);
+        for (size_t offset = 0; offset < list_size; ++offset) {
+            idx_t id = ids[offset];
+            if (id < 0) {
+                continue;
+            }
+            try {
+                reconstruct_from_offset(cluster, offset, vec.data());
+            } catch (...) {
+                continue;
+            }
+            idx_t best = -1;
+            try {
+                quantizer->assign(1, vec.data(), &best);
+            } catch (...) {
+                continue;
+            }
+            if (best < 0 || (size_t)best >= nlist) {
+                continue;
+            }
+            size_t dest = (size_t)best;
+            if (dest == cluster) {
+                continue;
+            }
+            removal_ids[cluster].push_back(id);
+            add_ids[dest].push_back(id);
+            auto& storage = add_vectors[dest];
+            storage.insert(storage.end(), vec.begin(), vec.end());
+            clusters_to_recompute.insert(cluster);
+            clusters_to_recompute.insert(dest);
+        }
+    }
+
+    if (removal_ids.empty()) {
+        return;
+    }
+
+    for (auto& kv : removal_ids) {
+        auto& ids = kv.second;
+        if (ids.empty()) {
+            continue;
+        }
+        IDSelectorArray sel(ids.size(), ids.data());
+        size_t removed = direct_map.remove_ids(sel, invlists);
+        ntotal -= removed;
+    }
+
+    for (auto& kv : add_vectors) {
+        size_t dest = kv.first;
+        auto& vecs = kv.second;
+        auto& ids = add_ids[dest];
+        size_t count = ids.size();
+        if (count == 0) {
+            continue;
+        }
+        std::vector<idx_t> coarse(count, dest);
+        add_core(count, vecs.data(), ids.data(), coarse.data(), nullptr, false);
+    }
+
+    for (size_t cluster : clusters_to_recompute) {
+        if (cluster < nlist) {
+            recompute_cluster_centroid(cluster, true);
+        }
+    }
+}
+
 void IndexIVF::maintain_affected_clusters(
         const std::unordered_set<size_t>& affected_clusters,
         bool update_quantizer) {
+    // 运行时开关：通过环境变量禁用所有维护（包括质心重算与结构性调整）
+    // 使用方式：FAISS_DISABLE_MAINTENANCE=1 将直接返回
+    const char* disable_env = getenv("FAISS_DISABLE_MAINTENANCE");
+    if (disable_env && disable_env[0] == '1') {
+        if (verbose) {
+            printf("IndexIVF::maintain_affected_clusters: disabled by env FAISS_DISABLE_MAINTENANCE\n");
+        }
+        return;
+    }
+    // 可控批处理维护：非递归、带预算与迭代上限
+    static std::atomic<bool> in_maintenance(false);
     if (affected_clusters.empty()) {
         return;
     }
-    
-    // 暂时禁用自动维护以避免递归问题
-    // TODO: 重新设计维护逻辑以支持增量维护
-    if (verbose) {
-        printf("IndexIVF::maintain_affected_clusters: auto-maintenance temporarily disabled\n");
+    bool expected = false;
+    if (!in_maintenance.compare_exchange_strong(expected, true)) {
+        if (verbose) {
+            printf("IndexIVF::maintain_affected_clusters: already in maintenance, skip\n");
+        }
+        return;
     }
-    return;
-    
-    // 计算平均聚类大小，用于确定阈值
-    size_t total_vectors = ntotal;
-    size_t avg_cluster_size = (nlist > 0 && total_vectors > 0) ? (total_vectors / nlist) : 0;
-    
-    // 设置阈值
-    size_t split_threshold = avg_cluster_size * 3;
-    if (split_threshold < 100) split_threshold = 100;  // 最小阈值
-    
-    size_t merge_threshold = avg_cluster_size / 3;
-    if (merge_threshold < 10) merge_threshold = 10;  // 最小阈值
-    
-    if (verbose) {
-        printf("IndexIVF::maintain_affected_clusters: maintaining %zd clusters (split_threshold=%zd, merge_threshold=%zd)\n",
-               affected_clusters.size(), split_threshold, merge_threshold);
-    }
-    
-    // 对每个受影响的聚类进行维护
-    // 注意：在维护过程中，nlist 可能会改变（分裂会增加nlist）
-    // 所以我们需要在每次迭代时重新检查 list_no 的有效性
-    std::vector<size_t> clusters_to_maintain(affected_clusters.begin(), affected_clusters.end());
-    for (size_t list_no : clusters_to_maintain) {
-        // 在每次迭代时检查 list_no 是否仍然有效
-        // 如果 nlist 在维护过程中增加了，某些 list_no 可能仍然有效
-        if (list_no < nlist) {
-            // 在调用 maintain_cluster 之前，再次检查 quantizer 和 nlist 是否同步
-            // 如果不同步，跳过这个聚类
-            if (quantizer->ntotal == nlist) {
-                maintain_cluster(list_no, split_threshold, merge_threshold, 2, update_quantizer);
-            } else {
-                if (verbose) {
-                    printf("Warning: maintain_affected_clusters: skipping cluster %zd due to quantizer/nlist mismatch (%zd != %zd)\n",
-                           list_no, quantizer->ntotal, nlist);
-                }
+    try {
+        // 快照，避免在维护中使用变化中的全局量判断阈值
+        size_t snapshot_nlist = nlist;
+        size_t snapshot_ntotal = ntotal;
+        if (snapshot_nlist == 0 || snapshot_ntotal == 0) {
+            in_maintenance = false;
+            return;
+        }
+        // 将输入聚类裁剪到当前快照范围
+        std::vector<size_t> clusters_to_maintain;
+        clusters_to_maintain.reserve(affected_clusters.size());
+        for (size_t list_no : affected_clusters) {
+            if (list_no < snapshot_nlist) {
+                clusters_to_maintain.push_back(list_no);
             }
         }
+        if (clusters_to_maintain.empty()) {
+            in_maintenance = false;
+            return;
+        }
+        // 预算与阈值参数
+        const size_t max_iterations = 16;                 // 迭代上限
+        const size_t min_split_size = 100;               // 分裂最小样本
+        const size_t min_merge_size = 10;                // 合并最小样本
+        size_t max_structural_changes = 32;               // 本轮最多分裂/合并次数（可用环境变量覆盖）
+        if (const char* env_sc = getenv("FAISS_STRUCT_CHANGES")) {
+            long v = strtol(env_sc, nullptr, 10);
+            if (v >= 0) {
+                max_structural_changes = (size_t)v;
+            }
+        }
+        if (verbose) {
+            printf("IndexIVF::maintain_affected_clusters: batch maintenance on %zd clusters\n",
+                   clusters_to_maintain.size());
+        }
+        size_t structural_changes = 0;
+        for (size_t iter = 0; iter < max_iterations; ++iter) {
+            size_t actions_this_iter = 0;
+            // 动态依据最新快照计算阈值（迟滞已由 3x 与 1/3x 隐含提供）
+            size_t avg_cluster_size =
+                    (snapshot_nlist > 0 && snapshot_ntotal > 0)
+                            ? (snapshot_ntotal / snapshot_nlist)
+                            : 0;
+            size_t split_threshold = avg_cluster_size * 3;
+            if (split_threshold < min_split_size) {
+                split_threshold = min_split_size;
+            }
+            size_t merge_threshold = avg_cluster_size / 3;
+            if (merge_threshold < min_merge_size) {
+                merge_threshold = min_merge_size;
+            }
+            if (verbose) {
+                printf("  iter=%zd avg=%zd split_thr=%zd merge_thr=%zd\n",
+                       iter, avg_cluster_size, split_threshold, merge_threshold);
+            }
+            for (size_t list_no : clusters_to_maintain) {
+                // 防御性检查：运行时 nlist 可能变化（例如分裂后）
+                if (list_no >= nlist) {
+                    continue;
+                }
+                size_t size = invlists->list_size(list_no);
+                if (size == 0) {
+                    continue;
+                }
+                // 保证 quantizer 和 nlist 同步时才做结构调整
+                bool can_restructure = (quantizer->ntotal == nlist);
+                if (size > split_threshold &&
+                    can_restructure &&
+                    structural_changes < max_structural_changes) {
+                    // 分裂（K=2）
+                    maintain_cluster(
+                            list_no, split_threshold, merge_threshold, 2, update_quantizer);
+                    structural_changes++;
+                    actions_this_iter++;
+                    continue;
+                }
+                if (size < merge_threshold &&
+                    size >= 1 &&
+                    can_restructure &&
+                    structural_changes < max_structural_changes) {
+                    // 合并
+                    maintain_cluster(
+                            list_no, split_threshold, merge_threshold, 2, update_quantizer);
+                    structural_changes++;
+                    actions_this_iter++;
+                    continue;
+                }
+                // 中等大小：仅重算质心
+                recompute_cluster_centroid(list_no, update_quantizer);
+            }
+            // 若本轮无结构调整，提前结束
+            if (actions_this_iter == 0) {
+                break;
+            }
+            // 更新快照，下一轮使用最新的 nlist/ntotal
+            snapshot_nlist = nlist;
+            snapshot_ntotal = ntotal;
+        }
+    } catch (...) {
+        in_maintenance = false;
+        throw;
     }
+    in_maintenance = false;
 }
 
 } // namespace faiss
