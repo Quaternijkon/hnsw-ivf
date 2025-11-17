@@ -44,7 +44,12 @@ float* fvecs_read(const char* fname, size_t* d_out, size_t* n_out) {
         abort();
     }
     int d;
-    fread(&d, 1, sizeof(int), f);
+    size_t header_read = fread(&d, sizeof(int), 1, f);
+    if (header_read != 1) {
+        fprintf(stderr, "错误: 无法读取文件 %s 的维度信息\n", fname);
+        fclose(f);
+        abort();
+    }
     assert((d > 0 && d < 1000000) || !"维度不合理");
     fseek(f, 0, SEEK_SET);
     struct stat st;
@@ -56,8 +61,16 @@ float* fvecs_read(const char* fname, size_t* d_out, size_t* n_out) {
     *d_out = d;
     *n_out = n;
     float* x = new float[n * (d + 1)];
-    size_t nr __attribute__((unused)) = fread(x, sizeof(float), n * (d + 1), f);
-    assert(nr == n * (d + 1) || !"无法读取完整文件");
+    size_t nr = fread(x, sizeof(float), n * (d + 1), f);
+    if (nr != n * (d + 1)) {
+        fprintf(stderr, "错误: 读取文件 %s 时发生截断 (expect=%zu, got=%zu)\n",
+                fname,
+                n * (d + 1),
+                nr);
+        fclose(f);
+        delete[] x;
+        abort();
+    }
 
     // 移除每行的维度头，将数据压缩
     for (size_t i = 0; i < n; i++)

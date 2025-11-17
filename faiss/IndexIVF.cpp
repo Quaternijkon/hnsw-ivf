@@ -2133,12 +2133,16 @@ size_t IndexIVF::split_large_clusters(
         std::vector<float> cluster_vectors(list_size * d);
         std::vector<idx_t> cluster_ids(list_size);
         
-        InvertedLists::ScopedCodes codes(invlists, list_no);
-        InvertedLists::ScopedIds ids(invlists, list_no);
-        
-        for (size_t offset = 0; offset < list_size; offset++) {
-            cluster_ids[offset] = ids[offset];
-            reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+        {
+            // 限定 ScopedCodes/ScopedIds 的生命周期，防止在 replace_invlists
+            // 后访问被释放的倒排列表
+            InvertedLists::ScopedCodes codes(invlists, list_no);
+            InvertedLists::ScopedIds ids(invlists, list_no);
+
+            for (size_t offset = 0; offset < list_size; offset++) {
+                cluster_ids[offset] = ids[offset];
+                reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+            }
         }
         
         // 2. 使用k-means将聚类分裂成split_factor个子聚类
@@ -2535,13 +2539,17 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
         // 获取该聚类的所有向量和ID
         std::vector<float> cluster_vectors(list_size * d);
         std::vector<idx_t> cluster_ids(list_size);
-        
-        InvertedLists::ScopedCodes codes(invlists, list_no);
-        InvertedLists::ScopedIds ids(invlists, list_no);
-        
-        for (size_t offset = 0; offset < list_size; offset++) {
-            cluster_ids[offset] = ids[offset];
-            reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+
+        {
+            // 限定 ScopedCodes/ScopedIds 生命周期，防止在 replace_invlists
+            // 后访问被释放的倒排列表
+            InvertedLists::ScopedCodes codes(invlists, list_no);
+            InvertedLists::ScopedIds ids(invlists, list_no);
+
+            for (size_t offset = 0; offset < list_size; offset++) {
+                cluster_ids[offset] = ids[offset];
+                reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+            }
         }
         
         // 使用k-means将聚类分裂成split_factor个子聚类
@@ -2749,14 +2757,17 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
             std::vector<float> cluster_vectors(list_size * d);
             std::vector<idx_t> cluster_ids(list_size);
             
-            InvertedLists::ScopedCodes codes(invlists, list_no);
-            InvertedLists::ScopedIds ids(invlists, list_no);
-            
-            // 安全地获取向量和ID
-            // 注意：list_size 已经在前面检查过了，所以这里应该是安全的
-            for (size_t offset = 0; offset < list_size; offset++) {
-                cluster_ids[offset] = ids[offset];
-                reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+            {
+                // 同样限制 ScopedCodes/ScopedIds 生命周期，避免后续结构修改
+                InvertedLists::ScopedCodes codes(invlists, list_no);
+                InvertedLists::ScopedIds ids(invlists, list_no);
+
+                // 安全地获取向量和ID
+                // 注意：list_size 已经在前面检查过了，所以这里应该是安全的
+                for (size_t offset = 0; offset < list_size; offset++) {
+                    cluster_ids[offset] = ids[offset];
+                    reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+                }
             }
             
             // 从小聚类中移除向量
