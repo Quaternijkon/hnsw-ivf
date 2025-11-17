@@ -2588,6 +2588,12 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
         size_t new_nlist = nlist + (split_factor - 1);
         ArrayInvertedLists* new_invlists = new ArrayInvertedLists(new_nlist, code_size);
         
+        // CRITICAL FIX: Remove split cluster vectors from direct_map before replacing invlists
+        // This prevents stale entries in direct_map after invlists replacement
+        IDSelectorArray split_sel(list_size, cluster_ids.data());
+        direct_map.remove_ids(split_sel, invlists);
+        ntotal -= list_size;
+        
         // 迁移现有数据（排除需要重新分配的向量）
         std::unordered_set<idx_t> ids_to_remove_set(cluster_ids.begin(), cluster_ids.end());
         for (size_t i = 0; i < nlist; i++) {
@@ -2615,9 +2621,18 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
             }
         }
         
-        // 替换invlists
+        // 替换invlists并重建direct_map
+        // After replacing invlists, the old direct_map entries have invalid offsets
+        // We need to rebuild the direct_map from the new invlists
         nlist = new_nlist;
         replace_invlists(new_invlists, true);
+        
+        // Rebuild direct_map from new invlists
+        // This ensures all (list_no, offset) pairs are correct for the new structure
+        DirectMap::Type old_dm_type = direct_map.type;
+        if (old_dm_type != DirectMap::NoMap) {
+            direct_map.set_type(old_dm_type, invlists, ntotal);
+        }
         
         // 添加新质心到quantizer
         quantizer->add(split_factor - 1, new_centroids.data());
@@ -2629,11 +2644,18 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
         
         // 更新原聚类的质心（使用第一个子聚类的质心）
         // 检查 list_no 是否在 quantizer 的有效范围内
+        // CRITICAL FIX: Get pointer AFTER all add operations to avoid stale pointer
         if (list_no < quantizer->ntotal) {
             IndexFlat* flat_quantizer = dynamic_cast<IndexFlat*>(quantizer);
             if (flat_quantizer) {
+                // Get pointer AFTER quantizer->add to ensure it's not stale
                 float* quantizer_data = flat_quantizer->get_xb();
-                memcpy(quantizer_data + list_no * d, clus.centroids.data(), d * sizeof(float));
+                // Verify the pointer is valid and within bounds
+                if (quantizer_data && (list_no + 1) * d <= flat_quantizer->ntotal * d) {
+                    memcpy(quantizer_data + list_no * d, clus.centroids.data(), d * sizeof(float));
+                } else if (verbose) {
+                    printf("Warning: maintain_cluster: invalid quantizer_data pointer or out of bounds access\n");
+                }
             }
         } else if (verbose) {
             printf("Warning: maintain_cluster: list_no %zd >= quantizer->ntotal %zd, skipping centroid update\n",
