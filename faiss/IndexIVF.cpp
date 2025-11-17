@@ -202,10 +202,10 @@ void IndexIVF::add_with_ids(idx_t n, const float* x, const idx_t* xids) {
                 quantizer->ntotal == nlist,
                 "quantizer and nlist must be synchronized before add_with_ids");
     }
-    
+   
     std::unique_ptr<idx_t[]> coarse_idx(new idx_t[n]);
     quantizer->assign(n, x, coarse_idx.get());
-    add_core(n, x, xids, coarse_idx.get());
+    add_core(n, x, xids, coarse_idx.get(), nullptr, true);  // CHANGE: Pass true for auto_maintain
 }
 
 void IndexIVF::add_sa_codes(idx_t n, const uint8_t* codes, const idx_t* xids) {
@@ -2436,6 +2436,13 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_clusters(
  *************************************************************************/
 
 bool IndexIVF::recompute_cluster_centroid(size_t list_no, bool update_quantizer) {
+    if (quantizer->ntotal != nlist) {
+        if (verbose) {
+            printf("Warning: recompute_cluster_centroid: skipping due to mismatch (%zd != %zd)\n",
+                   quantizer->ntotal, nlist);
+        }
+        return false;
+    }
     FAISS_THROW_IF_NOT(is_trained);
     FAISS_THROW_IF_NOT(invlists != nullptr);
     FAISS_THROW_IF_NOT(list_no < nlist);
@@ -2508,6 +2515,13 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
         size_t merge_threshold,
         int split_factor,
         bool update_quantizer) {
+    if (quantizer->ntotal != nlist) {
+        if (verbose) {
+            printf("Warning: maintain_cluster: skipping cluster %zd due to mismatch (%zd != %zd)\n",
+                    list_no, quantizer->ntotal, nlist);
+        }
+        return ClusterMaintenanceStats{}; // Skip
+    }
     ClusterMaintenanceStats stats;
     FAISS_THROW_IF_NOT(is_trained);
     FAISS_THROW_IF_NOT(invlists != nullptr);
@@ -2791,55 +2805,65 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
 }
 
 void IndexIVF::maintain_affected_clusters(
-        const std::unordered_set<size_t>& affected_clusters,
-        bool update_quantizer) {
-    if (affected_clusters.empty()) {
-        return;
-    }
-    
-    // 暂时禁用自动维护以避免递归问题
-    // TODO: 重新设计维护逻辑以支持增量维护
+    const std::unordered_set<size_t>& affected_clusters,
+    bool update_quantizer) {
+if (affected_clusters.empty()) {
+    return;
+}
+
+// CHANGE: Add sync check to prevent errors
+if (quantizer->ntotal != nlist) {
     if (verbose) {
-        printf("IndexIVF::maintain_affected_clusters: auto-maintenance temporarily disabled\n");
+        printf("Warning: maintain_affected_clusters: skipping due to quantizer/ntotal mismatch (%zd != %zd)\n",
+               quantizer->ntotal, nlist);
     }
     return;
-    
-    // 计算平均聚类大小，用于确定阈值
-    size_t total_vectors = ntotal;
-    size_t avg_cluster_size = (nlist > 0 && total_vectors > 0) ? (total_vectors / nlist) : 0;
-    
-    // 设置阈值
-    size_t split_threshold = avg_cluster_size * 3;
-    if (split_threshold < 100) split_threshold = 100;  // 最小阈值
-    
-    size_t merge_threshold = avg_cluster_size / 3;
-    if (merge_threshold < 10) merge_threshold = 10;  // 最小阈值
-    
-    if (verbose) {
-        printf("IndexIVF::maintain_affected_clusters: maintaining %zd clusters (split_threshold=%zd, merge_threshold=%zd)\n",
-               affected_clusters.size(), split_threshold, merge_threshold);
-    }
-    
-    // 对每个受影响的聚类进行维护
-    // 注意：在维护过程中，nlist 可能会改变（分裂会增加nlist）
-    // 所以我们需要在每次迭代时重新检查 list_no 的有效性
-    std::vector<size_t> clusters_to_maintain(affected_clusters.begin(), affected_clusters.end());
-    for (size_t list_no : clusters_to_maintain) {
-        // 在每次迭代时检查 list_no 是否仍然有效
-        // 如果 nlist 在维护过程中增加了，某些 list_no 可能仍然有效
-        if (list_no < nlist) {
-            // 在调用 maintain_cluster 之前，再次检查 quantizer 和 nlist 是否同步
-            // 如果不同步，跳过这个聚类
-            if (quantizer->ntotal == nlist) {
-                maintain_cluster(list_no, split_threshold, merge_threshold, 2, update_quantizer);
-            } else {
-                if (verbose) {
-                    printf("Warning: maintain_affected_clusters: skipping cluster %zd due to quantizer/nlist mismatch (%zd != %zd)\n",
-                           list_no, quantizer->ntotal, nlist);
-                }
+}
+
+// 暂时禁用自动维护以避免递归问题
+// TODO: 重新设计维护逻辑以支持增量维护
+// CHANGE: Remove the disabling printf and return to enable maintenance
+// if (verbose) {
+//     printf("IndexIVF::maintain_affected_clusters: auto-maintenance temporarily disabled\n");
+// }
+// return;
+
+// 计算平均聚类大小，用于确定阈值
+size_t total_vectors = ntotal;
+size_t avg_cluster_size = (nlist > 0 && total_vectors > 0) ? (total_vectors / nlist) : 0;
+
+// 设置阈值
+size_t split_threshold = avg_cluster_size * 3;
+if (split_threshold < 100) split_threshold = 100; // 最小阈值
+
+size_t merge_threshold = avg_cluster_size / 3;
+if (merge_threshold < 10) merge_threshold = 10; // 最小阈值
+
+if (verbose) {
+    printf("IndexIVF::maintain_affected_clusters: maintaining %zd clusters (split_threshold=%zd, merge_threshold=%zd)\n",
+           affected_clusters.size(), split_threshold, merge_threshold);
+}
+
+// 对每个受影响的聚类进行维护
+// 注意：在维护过程中，nlist 可能会改变（分裂会增加nlist）
+// 所以我们需要在每次迭代时重新检查 list_no 的有效性
+std::vector<size_t> clusters_to_maintain(affected_clusters.begin(), affected_clusters.end());
+for (size_t list_no : clusters_to_maintain) {
+    // 在每次迭代时检查 list_no 是否仍然有效
+    // 如果 nlist 在维护过程中增加了，某些 list_no 可能仍然有效
+    if (list_no < nlist) {
+        // 在调用 maintain_cluster 之前，再次检查 quantizer 和 nlist 是否同步
+        // 如果不同步，跳过这个聚类
+        if (quantizer->ntotal == nlist) {
+            maintain_cluster(list_no, split_threshold, merge_threshold, 2, update_quantizer);
+        } else {
+            if (verbose) {
+                printf("Warning: maintain_affected_clusters: skipping cluster %zd due to quantizer/nlist mismatch (%zd != %zd)\n",
+                       list_no, quantizer->ntotal, nlist);
             }
         }
     }
+}
 }
 
 } // namespace faiss
