@@ -1730,40 +1730,16 @@ void IndexIVF::update_vectors(int n, const idx_t* new_ids, const float* x) {
         FAISS_THROW_IF_NOT_MSG(
                 nremove == n, "did not find all entries to remove");
         
-        // 检查 nlist 和 quantizer 是否同步
-        // 如果不同步，说明删除操作触发了聚类维护（分裂或合并）
-        if (quantizer->ntotal != nlist) {
-            if (verbose) {
-                printf("Warning: After remove_ids, quantizer->ntotal (%zd) != nlist (%zd)\n",
-                       quantizer->ntotal, nlist);
-                printf("  nlist changed: %zd -> %zd\n", nlist_before, nlist);
-                printf("  quantizer->ntotal changed: %zd -> %zd\n", quantizer_ntotal_before, quantizer->ntotal);
-            }
-            
-            // 如果 nlist 增加了（分裂），quantizer 应该已经更新了
-            // 但如果不同步，我们需要修复
-            if (nlist > quantizer->ntotal) {
-                // nlist 增加了但 quantizer 没有同步，添加零向量质心
-                std::vector<float> new_centroids((nlist - quantizer->ntotal) * d, 0.0f);
-                quantizer->add(nlist - quantizer->ntotal, new_centroids.data());
-            } else if (nlist < quantizer->ntotal) {
-                // nlist 减少了（不应该发生），重置 quantizer
-                std::vector<float> centroids(nlist * d);
-                for (size_t i = 0; i < nlist && i < quantizer->ntotal; i++) {
-                    quantizer->reconstruct(i, centroids.data() + i * d);
-                }
-                quantizer->reset();
-                quantizer->add(nlist, centroids.data());
-            }
-        }
-        
         // 验证同步
         FAISS_THROW_IF_NOT_MSG(
                 quantizer->ntotal == nlist,
                 "quantizer and nlist must be synchronized before add_with_ids");
         
         // 现在可以安全地添加新向量
-        add_with_ids(n, x, new_ids);
+        // 直接调用add_core(false)以避免递归维护
+        std::unique_ptr<idx_t[]> coarse_idx(new idx_t[n]);
+        quantizer->assign(n, x, coarse_idx.get());
+        add_core(n, x, new_ids, coarse_idx.get(), nullptr, false);
         return;
     }
 
