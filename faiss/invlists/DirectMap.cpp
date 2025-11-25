@@ -12,6 +12,9 @@
 #include <cassert>
 #include <cstdio>
 
+#include <chrono>
+#include <cstdlib>
+
 #include <faiss/impl/AuxIndexStructures.h>
 #include <faiss/impl/FaissAssert.h>
 #include <faiss/impl/IDSelector.h>
@@ -230,6 +233,10 @@ void DirectMap::update_codes(
 
     size_t code_size = invlists->code_size;
 
+    bool profile = getenv("FAISS_PROFILE_UPDATES") != nullptr;
+    std::chrono::high_resolution_clock::time_point t0;
+    if (profile) t0 = std::chrono::high_resolution_clock::now();
+
     for (size_t i = 0; i < n; i++) {
         idx_t id = ids[i];
         FAISS_THROW_IF_NOT_MSG(
@@ -254,6 +261,12 @@ void DirectMap::update_codes(
             array[id] = dm;
             invlists->add_entry(il, id, codes + i * code_size);
         }
+    }
+
+    if (profile) {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        fprintf(stderr, "[FAISS_PROFILE] DirectMap::update_codes: n=%d time=%.3f ms\n", n, ms);
     }
 }
 

@@ -208,6 +208,10 @@ struct IndexIVF : Index, IndexIVFInterface {
     /// centroids?
     bool by_residual = true;
 
+        /// Track whether a given inverted list is actively used (true) or kept as
+        /// an inactive placeholder that should be skipped during coarse search.
+        std::vector<char> list_active_;
+
     /** The Inverted file takes a quantizer (an Index) on input,
      * which implements the function mapping a vector to a list
      * identifier.
@@ -279,7 +283,7 @@ struct IndexIVF : Index, IndexIVFInterface {
     /// they need
     virtual idx_t train_encoder_num_vectors() const;
 
-    void search_preassigned(
+        void search_preassigned(
             idx_t n,
             const float* x,
             idx_t k,
@@ -290,7 +294,7 @@ struct IndexIVF : Index, IndexIVFInterface {
             bool store_pairs,
             const IVFSearchParameters* params = nullptr,
             IndexIVFStats* stats = nullptr
-        ) const;
+                ) const override;
 
         
 
@@ -575,7 +579,9 @@ struct IndexIVF : Index, IndexIVFInterface {
      */
     void maintain_affected_clusters(
             const std::unordered_set<size_t>& affected_clusters,
-            bool update_quantizer = true);
+            bool update_quantizer = true,
+            const std::unordered_map<size_t, size_t>* change_counts = nullptr,
+            float min_change_ratio = 0.0f);
 
     /* The standalone codec interface (except sa_decode that is specific) */
     size_t sa_code_size() const override;
@@ -590,6 +596,20 @@ struct IndexIVF : Index, IndexIVFInterface {
     void sa_encode(idx_t n, const float* x, uint8_t* bytes) const override;
 
     IndexIVF();
+
+protected:
+        size_t remove_ids_collect(
+                const IDSelector& sel,
+                std::unordered_set<size_t>& affected_clusters,
+                std::unordered_map<size_t, size_t>* change_counts = nullptr);
+
+        void ensure_active_list_size(size_t target, char value = 1);
+
+        void fill_inactive_centroid(float* centroid) const;
+
+        void update_quantizer_centroid(size_t list_no, const float* centroid);
+
+        size_t active_list_count() const;
 };
 
 struct RangeQueryResult;

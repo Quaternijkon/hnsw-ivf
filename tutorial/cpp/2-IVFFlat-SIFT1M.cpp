@@ -2,7 +2,7 @@
  * @Author: Quaternijkon quaternijkon@mail.ustc.edu.cn
  * @Date: 2025-02-07 06:29:50
  * @LastEditors: Quaternijkon quaternijkon@mail.ustc.edu.cn
- * @LastEditTime: 2025-11-06 10:58:03
+ * @LastEditTime: 2025-11-18 10:13:58
  * @FilePath: /faiss/tutorial/cpp/2-IVFFlat-SIFT1M.cpp
  * @Description: 基于 SIFT1M 数据集验证 IndexIVF 自动聚类维护功能
  */

@@ -317,6 +317,18 @@ void ArrayInvertedLists::resize(size_t list_no, size_t new_size) {
     codes[list_no].resize(new_size * code_size);
 }
 
+void ArrayInvertedLists::resize_nlist(size_t new_nlist) {
+    if (new_nlist < nlist) {
+        FAISS_THROW_MSG("ArrayInvertedLists::resize_nlist does not support shrinking nlist");
+    }
+    if (new_nlist == nlist) {
+        return;
+    }
+    ids.resize(new_nlist);
+    codes.resize(new_nlist);
+    nlist = new_nlist;
+}
+
 void ArrayInvertedLists::update_entries(
         size_t list_no,
         size_t offset,
