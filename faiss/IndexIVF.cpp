@@ -465,28 +465,46 @@ void IndexIVF::search_with_hnsw(
             std::min(nlist, params ? params->nprobe : this->nprobe);
     FAISS_THROW_IF_NOT(nprobe > 0);
     
-    // Save and temporarily set HNSW efSearch if specified
-    int original_ef_search = hnsw_quantizer->hnsw.efSearch;
-    if (hnsw_ef_search > 0) {
-        hnsw_quantizer->hnsw.efSearch = hnsw_ef_search;
-    }
+    // RAII helper class to restore HNSW efSearch on scope exit
+    // This ensures exception safety and avoids duplicated cleanup code
+    struct HNSWEfSearchGuard {
+        HNSW& hnsw;
+        int original_ef_search;
+        bool modified;
+        
+        HNSWEfSearchGuard(HNSW& h, int new_ef_search)
+            : hnsw(h), original_ef_search(h.efSearch), modified(false) {
+            if (new_ef_search > 0) {
+                hnsw.efSearch = new_ef_search;
+                modified = true;
+            }
+        }
+        
+        ~HNSWEfSearchGuard() {
+            if (modified) {
+                hnsw.efSearch = original_ef_search;
+            }
+        }
+    };
     
-    // HNSW-optimized parallel mode: use mode 3 for finer granularity
-    // when dealing with HNSW quantizer since HNSW search is already
-    // well-optimized for individual queries
-    int effective_parallel_mode = parallel_mode;
+    // Create guard to manage efSearch modification - restores original value on scope exit
+    // Note: Modifying hnsw.efSearch is necessary for per-search customization.
+    // The IndexHNSW quantizer is not const (quantizer is Index*), allowing this modification.
+    HNSWEfSearchGuard ef_guard(hnsw_quantizer->hnsw, hnsw_ef_search);
     
-    // For HNSW quantizer, parallel mode 3 (finer granularity over queries)
-    // often works better because:
-    // 1. HNSW's graph structure provides good locality of reference
-    // 2. Each query's quantization result tends to be well-distributed
-    // 3. Reduces contention when multiple threads access the graph
-    bool use_hnsw_optimized_parallel = 
-        (parallel_mode & ~PARALLEL_MODE_NO_HEAP_INIT) == 0 && n > 1;
+    // HNSW-optimized parallel mode determination
+    // Check if parallel_mode is 0 or only has PARALLEL_MODE_NO_HEAP_INIT flag set:
+    // - parallel_mode == 0: split over queries (default)
+    // - parallel_mode == PARALLEL_MODE_NO_HEAP_INIT: same as 0 but skip heap init
+    int base_parallel_mode = parallel_mode & ~PARALLEL_MODE_NO_HEAP_INIT;
+    bool use_hnsw_optimized_parallel = (base_parallel_mode == 0) && (n > 1);
     
-    // Batch size for HNSW quantization - processing in batches improves
-    // cache efficiency for HNSW's graph traversal
-    const idx_t hnsw_batch_size = std::min((idx_t)256, n);
+    // Batch size for HNSW quantization (256 chosen empirically):
+    // - 256 queries fit well in L2 cache for most systems
+    // - Provides good balance between parallelism and cache locality
+    // - HNSW's graph traversal benefits from processing batches that can
+    //   share visited nodes in the graph structure
+    const idx_t hnsw_batch_size = std::min(static_cast<idx_t>(256), n);
     
     // Search function for a batch of queries with HNSW-specific optimizations
     auto hnsw_sub_search_func = [this, k, nprobe, params, hnsw_quantizer](
@@ -537,7 +555,11 @@ void IndexIVF::search_with_hnsw(
     if (use_hnsw_optimized_parallel) {
         // HNSW-optimized parallel execution with batched processing
         // Process queries in batches to improve cache locality
-        int nt = std::min(omp_get_max_threads(), (int)((n + hnsw_batch_size - 1) / hnsw_batch_size));
+        
+        // Calculate number of threads safely: limit by both batch count and max threads
+        idx_t num_batches = (n + hnsw_batch_size - 1) / hnsw_batch_size;
+        int max_threads = omp_get_max_threads();
+        int nt = static_cast<int>(std::min(num_batches, static_cast<idx_t>(max_threads)));
         nt = std::max(1, nt);
         
         std::vector<IndexIVFStats> stats(nt);
@@ -550,26 +572,21 @@ void IndexIVF::search_with_hnsw(
             idx_t batch_n = batch_end - batch_start;
             int thread_id = omp_get_thread_num();
             
-            if (batch_n > 0) {
-                try {
-                    hnsw_sub_search_func(
-                            batch_n,
-                            x + batch_start * d,
-                            distances + batch_start * k,
-                            labels + batch_start * k,
-                            &stats[thread_id]);
-                } catch (const std::exception& e) {
-                    std::lock_guard<std::mutex> lock(exception_mutex);
-                    exception_string = e.what();
-                }
+            try {
+                hnsw_sub_search_func(
+                        batch_n,
+                        x + batch_start * d,
+                        distances + batch_start * k,
+                        labels + batch_start * k,
+                        &stats[thread_id]);
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lock(exception_mutex);
+                exception_string = e.what();
             }
         }
 
         if (!exception_string.empty()) {
-            // Restore HNSW efSearch before throwing
-            if (hnsw_ef_search > 0) {
-                hnsw_quantizer->hnsw.efSearch = original_ef_search;
-            }
+            // ef_guard will restore efSearch via RAII
             FAISS_THROW_MSG(exception_string.c_str());
         }
 
@@ -577,17 +594,19 @@ void IndexIVF::search_with_hnsw(
         for (int i = 0; i < nt; i++) {
             indexIVF_stats.add(stats[i]);
         }
-    } else if ((effective_parallel_mode & ~PARALLEL_MODE_NO_HEAP_INIT) == 3) {
+    } else if (base_parallel_mode == 3) {
         // Parallel mode 3: finer granularity over queries
         // This works well with HNSW because the graph structure provides
         // good load balancing across queries
-        int nt = std::min(omp_get_max_threads(), (int)n);
+        int max_threads = omp_get_max_threads();
+        int nt = static_cast<int>(std::min(n, static_cast<idx_t>(max_threads)));
+        nt = std::max(1, nt);
         std::vector<IndexIVFStats> stats(nt);
         std::mutex exception_mutex;
         std::string exception_string;
 
 #pragma omp parallel for if (nt > 1)
-        for (idx_t slice = 0; slice < nt; slice++) {
+        for (int slice = 0; slice < nt; slice++) {
             idx_t i0 = n * slice / nt;
             idx_t i1 = n * (slice + 1) / nt;
             if (i1 > i0) {
@@ -606,15 +625,12 @@ void IndexIVF::search_with_hnsw(
         }
 
         if (!exception_string.empty()) {
-            // Restore HNSW efSearch before throwing
-            if (hnsw_ef_search > 0) {
-                hnsw_quantizer->hnsw.efSearch = original_ef_search;
-            }
+            // ef_guard will restore efSearch via RAII
             FAISS_THROW_MSG(exception_string.c_str());
         }
 
         // Collect stats
-        for (idx_t slice = 0; slice < nt; slice++) {
+        for (int slice = 0; slice < nt; slice++) {
             indexIVF_stats.add(stats[slice]);
         }
     } else {
@@ -622,10 +638,7 @@ void IndexIVF::search_with_hnsw(
         hnsw_sub_search_func(n, x, distances, labels, &indexIVF_stats);
     }
     
-    // Restore original HNSW efSearch
-    if (hnsw_ef_search > 0) {
-        hnsw_quantizer->hnsw.efSearch = original_ef_search;
-    }
+    // ef_guard destructor automatically restores original efSearch
 }
 
 void IndexIVF::search_preassigned(
