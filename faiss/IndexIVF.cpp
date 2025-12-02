@@ -14,12 +14,14 @@
 #include <memory>
 #include <mutex>
 #include <chrono>
+#include <cstdlib>
 
 #include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <faiss/utils/hamming.h>
@@ -43,6 +45,13 @@ struct Timer {
         return std::chrono::duration<double, std::micro>(t1 - t0).count();
     }
 };
+
+namespace {
+constexpr float kClusterChangeRatio = 0.05f;
+// Skip automatic maintenance for large bulk additions to avoid slowing
+// down initial dataset ingestion (e.g., loading SIFT1M base vectors).
+constexpr size_t kAutoMaintainMaxBatch = 200000;
+}
 
 namespace faiss {
 
@@ -179,7 +188,8 @@ IndexIVF::IndexIVF(
           IndexIVFInterface(quantizer, nlist),
           invlists(new ArrayInvertedLists(nlist, code_size)),
           own_invlists(true),
-          code_size(code_size) {
+          code_size(code_size),
+          list_active_(nlist, 1) {
     FAISS_THROW_IF_NOT(d == quantizer->d);
     is_trained = quantizer->is_trained && (quantizer->ntotal == nlist);
     // Spherical by default if the metric is inner_product
@@ -205,7 +215,12 @@ void IndexIVF::add_with_ids(idx_t n, const float* x, const idx_t* xids) {
    
     std::unique_ptr<idx_t[]> coarse_idx(new idx_t[n]);
     quantizer->assign(n, x, coarse_idx.get());
-    add_core(n, x, xids, coarse_idx.get(), nullptr, true);  // CHANGE: Pass true for auto_maintain
+
+    // Large ingestions are handled in recursive batches, so only allow
+    // automatic maintenance when the top-level request itself is small
+    // enough to stay below the intended threshold.
+    bool allow_maintain = static_cast<size_t>(n) <= kAutoMaintainMaxBatch;
+    add_core(n, x, xids, coarse_idx.get(), nullptr, allow_maintain);
 }
 
 void IndexIVF::add_sa_codes(idx_t n, const uint8_t* codes, const idx_t* xids) {
@@ -239,19 +254,20 @@ void IndexIVF::add_core(
                        i0,
                        i1);
             }
-            add_core(
+                add_core(
                     i1 - i0,
                     x + i0 * d,
                     xids ? xids + i0 : nullptr,
                     coarse_idx + i0,
                     inverted_list_context,
-                    auto_maintain);
+                    false);
         }
         return;
     }
     FAISS_THROW_IF_NOT(coarse_idx);
     FAISS_THROW_IF_NOT(is_trained);
     direct_map.check_can_add(xids);
+    const idx_t prev_ntotal = ntotal;
 
     size_t nadd = 0, nminus1 = 0;
 
@@ -307,20 +323,30 @@ void IndexIVF::add_core(
     }
 
     ntotal += n;
-    
+
+    const bool should_auto_maintain =
+            auto_maintain && prev_ntotal > 0 &&
+            static_cast<size_t>(n) <= kAutoMaintainMaxBatch;
+
     // 收集被插入的聚类，用于后续维护
-    if (auto_maintain) {
+    if (should_auto_maintain) {
         std::unordered_set<size_t> affected_clusters;
+        std::unordered_map<size_t, size_t> change_counts;
         for (size_t i = 0; i < n; i++) {
             idx_t list_no = coarse_idx[i];
             if (list_no >= 0 && (size_t)list_no < nlist) {
-                affected_clusters.insert(list_no);
+                size_t list_idx = static_cast<size_t>(list_no);
+                affected_clusters.insert(list_idx);
+                change_counts[list_idx]++;
             }
         }
         
         // 自动维护被插入的聚类
         if (!affected_clusters.empty()) {
-            maintain_affected_clusters(affected_clusters, true);
+            const std::unordered_map<size_t, size_t>* counts_ptr =
+                    change_counts.empty() ? nullptr : &change_counts;
+            float ratio = counts_ptr ? kClusterChangeRatio : 0.0f;
+            maintain_affected_clusters(affected_clusters, true, counts_ptr, ratio);
         }
     }
 }
@@ -1630,12 +1656,18 @@ void IndexIVF::reset() {
     direct_map.clear();
     invlists->reset();
     ntotal = 0;
+    list_active_.assign(nlist, 1);
 }
 
-size_t IndexIVF::remove_ids(const IDSelector& sel) {
-    // 收集被删除向量所在的聚类（在删除前）
-    std::unordered_set<size_t> affected_clusters;
-    
+size_t IndexIVF::remove_ids_collect(
+        const IDSelector& sel,
+        std::unordered_set<size_t>& affected_clusters,
+        std::unordered_map<size_t, size_t>* change_counts) {
+    affected_clusters.clear();
+    if (change_counts) {
+        change_counts->clear();
+    }
+
     if (direct_map.type == DirectMap::Hashtable) {
         // 对于Hashtable类型，我们可以从direct_map中获取聚类信息
         const IDSelectorArray* sela = dynamic_cast<const IDSelectorArray*>(&sel);
@@ -1646,6 +1678,9 @@ size_t IndexIVF::remove_ids(const IDSelector& sel) {
                 if (res != direct_map.hashtable.end()) {
                     size_t list_no = lo_listno(res->second);
                     affected_clusters.insert(list_no);
+                    if (change_counts) {
+                        (*change_counts)[list_no]++;
+                    }
                 }
             }
         } else {
@@ -1655,10 +1690,16 @@ size_t IndexIVF::remove_ids(const IDSelector& sel) {
                 size_t list_size = invlists->list_size(list_no);
                 if (list_size > 0) {
                     InvertedLists::ScopedIds ids(invlists, list_no);
+                    size_t local_changes = 0;
                     for (size_t offset = 0; offset < list_size; offset++) {
                         if (sel.is_member(ids[offset])) {
-                            affected_clusters.insert(list_no);
-                            break;  // 找到至少一个被删除的向量即可
+                            local_changes++;
+                        }
+                    }
+                    if (local_changes > 0) {
+                        affected_clusters.insert(list_no);
+                        if (change_counts) {
+                            (*change_counts)[list_no] += local_changes;
                         }
                     }
                 }
@@ -1670,14 +1711,20 @@ size_t IndexIVF::remove_ids(const IDSelector& sel) {
             size_t list_size = invlists->list_size(list_no);
             if (list_size > 0) {
                 InvertedLists::ScopedIds ids(invlists, list_no);
+                size_t local_changes = 0;
                 for (size_t offset = 0; offset < list_size; offset++) {
                     idx_t id = ids[offset];
                     if (id >= 0 && id < direct_map.array.size()) {
                         idx_t lo = direct_map.array[id];
                         if (lo >= 0 && sel.is_member(id)) {
-                            affected_clusters.insert(list_no);
-                            break;  // 找到至少一个被删除的向量即可
+                            local_changes++;
                         }
+                    }
+                }
+                if (local_changes > 0) {
+                    affected_clusters.insert(list_no);
+                    if (change_counts) {
+                        (*change_counts)[list_no] += local_changes;
                     }
                 }
             }
@@ -1688,10 +1735,16 @@ size_t IndexIVF::remove_ids(const IDSelector& sel) {
             size_t list_size = invlists->list_size(list_no);
             if (list_size > 0) {
                 InvertedLists::ScopedIds ids(invlists, list_no);
+                size_t local_changes = 0;
                 for (size_t offset = 0; offset < list_size; offset++) {
                     if (sel.is_member(ids[offset])) {
-                        affected_clusters.insert(list_no);
-                        break;  // 找到至少一个被删除的向量即可
+                        local_changes++;
+                    }
+                }
+                if (local_changes > 0) {
+                    affected_clusters.insert(list_no);
+                    if (change_counts) {
+                        (*change_counts)[list_no] += local_changes;
                     }
                 }
             }
@@ -1701,12 +1754,23 @@ size_t IndexIVF::remove_ids(const IDSelector& sel) {
     // 执行删除操作
     size_t nremove = direct_map.remove_ids(sel, invlists);
     ntotal -= nremove;
+
+    return nremove;
+}
+
+size_t IndexIVF::remove_ids(const IDSelector& sel) {
+    std::unordered_set<size_t> affected_clusters;
+    std::unordered_map<size_t, size_t> change_counts;
+    size_t nremove = remove_ids_collect(sel, affected_clusters, &change_counts);
     
     // 自动维护被删除向量所在的聚类
     if (!affected_clusters.empty() && nremove > 0) {
-        maintain_affected_clusters(affected_clusters, true);
+        const std::unordered_map<size_t, size_t>* counts_ptr =
+                change_counts.empty() ? nullptr : &change_counts;
+        float ratio = counts_ptr ? kClusterChangeRatio : 0.0f;
+        maintain_affected_clusters(affected_clusters, true, counts_ptr, ratio);
     }
-    
+
     return nremove;
 }
 
@@ -1720,42 +1784,19 @@ void IndexIVF::update_vectors(int n, const idx_t* new_ids, const float* x) {
         // 3. 然后添加新向量
         
         IDSelectorArray sel(n, new_ids);
+        bool profile = getenv("FAISS_PROFILE_UPDATES") != nullptr;
+        Timer t_total;
         
-        // 记录删除前的 nlist，以便检测变化
-        size_t nlist_before = nlist;
-        size_t quantizer_ntotal_before = quantizer->ntotal;
-        
-        // 执行删除操作（这会触发 maintain_affected_clusters）
-        size_t nremove = remove_ids(sel);
+        // 执行删除操作（暂不维护聚类，延后到新增完成后统一处理）
+        Timer t_del;
+        std::unordered_set<size_t> affected_clusters;
+        std::unordered_map<size_t, size_t> change_counts;
+        size_t nremove = remove_ids_collect(sel, affected_clusters, &change_counts);
+        if (profile) {
+            fprintf(stderr, "[FAISS_PROFILE] update_vectors: remove_ids: %.3f ms\n", t_del.elapsed_us() / 1000.0);
+        }
         FAISS_THROW_IF_NOT_MSG(
                 nremove == n, "did not find all entries to remove");
-        
-        // 检查 nlist 和 quantizer 是否同步
-        // 如果不同步，说明删除操作触发了聚类维护（分裂或合并）
-        if (quantizer->ntotal != nlist) {
-            if (verbose) {
-                printf("Warning: After remove_ids, quantizer->ntotal (%zd) != nlist (%zd)\n",
-                       quantizer->ntotal, nlist);
-                printf("  nlist changed: %zd -> %zd\n", nlist_before, nlist);
-                printf("  quantizer->ntotal changed: %zd -> %zd\n", quantizer_ntotal_before, quantizer->ntotal);
-            }
-            
-            // 如果 nlist 增加了（分裂），quantizer 应该已经更新了
-            // 但如果不同步，我们需要修复
-            if (nlist > quantizer->ntotal) {
-                // nlist 增加了但 quantizer 没有同步，添加零向量质心
-                std::vector<float> new_centroids((nlist - quantizer->ntotal) * d, 0.0f);
-                quantizer->add(nlist - quantizer->ntotal, new_centroids.data());
-            } else if (nlist < quantizer->ntotal) {
-                // nlist 减少了（不应该发生），重置 quantizer
-                std::vector<float> centroids(nlist * d);
-                for (size_t i = 0; i < nlist && i < quantizer->ntotal; i++) {
-                    quantizer->reconstruct(i, centroids.data() + i * d);
-                }
-                quantizer->reset();
-                quantizer->add(nlist, centroids.data());
-            }
-        }
         
         // 验证同步
         FAISS_THROW_IF_NOT_MSG(
@@ -1763,7 +1804,36 @@ void IndexIVF::update_vectors(int n, const idx_t* new_ids, const float* x) {
                 "quantizer and nlist must be synchronized before add_with_ids");
         
         // 现在可以安全地添加新向量
-        add_with_ids(n, x, new_ids);
+        // 直接调用add_core(false)以避免递归维护
+        std::unique_ptr<idx_t[]> coarse_idx(new idx_t[n]);
+        Timer t_assign;
+        quantizer->assign(n, x, coarse_idx.get());
+        if (profile) {
+            fprintf(stderr, "[FAISS_PROFILE] update_vectors: quantizer.assign: %.3f ms\n", t_assign.elapsed_us() / 1000.0);
+        }
+        Timer t_addcore;
+        add_core(n, x, new_ids, coarse_idx.get(), nullptr, false);
+        if (profile) {
+            fprintf(stderr, "[FAISS_PROFILE] update_vectors: add_core: %.3f ms\n", t_addcore.elapsed_us() / 1000.0);
+            fprintf(stderr, "[FAISS_PROFILE] update_vectors: total (remove+add): %.3f ms\n", t_total.elapsed_us() / 1000.0);
+        }
+
+        // 将新增向量所在的聚类加入维护集合，并在末尾统一维护
+        for (int i = 0; i < n; i++) {
+            idx_t list_no = coarse_idx[i];
+            if (list_no >= 0) {
+                size_t list_idx = static_cast<size_t>(list_no);
+                affected_clusters.insert(list_idx);
+                change_counts[list_idx]++;
+            }
+        }
+
+        const std::unordered_map<size_t, size_t>* counts_ptr =
+                change_counts.empty() ? nullptr : &change_counts;
+        if (!affected_clusters.empty()) {
+            float ratio = counts_ptr ? kClusterChangeRatio : 0.0f;
+            maintain_affected_clusters(affected_clusters, true, counts_ptr, ratio);
+        }
         return;
     }
 
@@ -1772,14 +1842,29 @@ void IndexIVF::update_vectors(int n, const idx_t* new_ids, const float* x) {
     // in continuous range of ids
 
     FAISS_THROW_IF_NOT(is_trained);
+    bool profile = getenv("FAISS_PROFILE_UPDATES") != nullptr;
+    Timer t_total;
     std::vector<idx_t> assign(n);
+    Timer t_assign;
     quantizer->assign(n, x, assign.data());
+    if (profile) {
+        fprintf(stderr, "[FAISS_PROFILE] update_vectors: quantizer.assign: %.3f ms\n", t_assign.elapsed_us() / 1000.0);
+    }
 
     std::vector<uint8_t> flat_codes(n * code_size);
+    Timer t_encode;
     encode_vectors(n, x, assign.data(), flat_codes.data());
+    if (profile) {
+        fprintf(stderr, "[FAISS_PROFILE] update_vectors: encode_vectors: %.3f ms\n", t_encode.elapsed_us() / 1000.0);
+    }
 
+    Timer t_dm;
     direct_map.update_codes(
             invlists, n, new_ids, assign.data(), flat_codes.data());
+    if (profile) {
+        fprintf(stderr, "[FAISS_PROFILE] DirectMap::update_codes (caller): %.3f ms\n", t_dm.elapsed_us() / 1000.0);
+        fprintf(stderr, "[FAISS_PROFILE] update_vectors: total: %.3f ms\n", t_total.elapsed_us() / 1000.0);
+    }
 }
 
 void IndexIVF::train(idx_t n, const float* x) {
@@ -1886,6 +1971,7 @@ void IndexIVF::replace_invlists(InvertedLists* il, bool own) {
     }
     invlists = il;
     own_invlists = own;
+    list_active_.assign(nlist, 1);
 }
 
 void IndexIVF::copy_subset_to(
@@ -2041,6 +2127,8 @@ size_t IndexIVF::recompute_centroids(bool update_quantizer) {
     if (verbose) {
         printf("IndexIVF::recompute_centroids: recomputing centroids for %zd clusters\n", nlist);
     }
+
+    ensure_active_list_size(nlist);
     
     // 先保存旧的 quantizer 质心（用于空聚类）
     std::vector<float> old_centroids;
@@ -2058,12 +2146,20 @@ size_t IndexIVF::recompute_centroids(bool update_quantizer) {
     for (size_t list_no = 0; list_no < nlist; list_no++) {
         size_t list_size = invlists->list_size(list_no);
         if (list_size == 0) {
-            // 空列表：使用旧的质心（如果存在），否则使用零向量
-            if (list_no < old_centroids.size() / d) {
-                memcpy(new_centroids.data() + list_no * d,
-                       old_centroids.data() + list_no * d,
-                       d * sizeof(float));
+            if (list_active_[list_no]) {
+                if (list_no < old_centroids.size() / d) {
+                    memcpy(new_centroids.data() + list_no * d,
+                           old_centroids.data() + list_no * d,
+                           d * sizeof(float));
+                }
+            } else {
+                fill_inactive_centroid(new_centroids.data() + list_no * d);
             }
+            continue;
+        }
+
+        if (!list_active_[list_no]) {
+            fill_inactive_centroid(new_centroids.data() + list_no * d);
             continue;
         }
         
@@ -2104,6 +2200,60 @@ size_t IndexIVF::recompute_centroids(bool update_quantizer) {
     return n_recomputed;
 }
 
+void IndexIVF::ensure_active_list_size(size_t target, char value) {
+    if (list_active_.size() < target) {
+        list_active_.resize(target, value);
+    }
+}
+
+void IndexIVF::fill_inactive_centroid(float* centroid) const {
+    const float sentinel = metric_type == METRIC_INNER_PRODUCT ? -1e30f : 1e30f;
+    for (size_t j = 0; j < d; j++) {
+        centroid[j] = sentinel;
+    }
+}
+
+void IndexIVF::update_quantizer_centroid(size_t list_no, const float* centroid) {
+    size_t qn = quantizer->ntotal;
+    FAISS_THROW_IF_NOT(list_no <= qn);
+
+    if (list_no == qn) {
+        quantizer->add(1, centroid);
+        return;
+    }
+
+    if (auto* flat = dynamic_cast<IndexFlat*>(quantizer)) {
+        float* xb = flat->get_xb();
+        memcpy(xb + list_no * d, centroid, sizeof(float) * d);
+        if (auto* flat_l2 = dynamic_cast<IndexFlatL2*>(flat)) {
+            flat_l2->clear_l2norms();
+        }
+        return;
+    }
+
+    std::vector<float> centroids(qn * d);
+    for (size_t i = 0; i < qn; i++) {
+        if (i == list_no) {
+            memcpy(centroids.data() + i * d, centroid, sizeof(float) * d);
+        } else {
+            quantizer->reconstruct(i, centroids.data() + i * d);
+        }
+    }
+    quantizer->reset();
+    quantizer->add(qn, centroids.data());
+}
+
+size_t IndexIVF::active_list_count() const {
+    size_t count = 0;
+    size_t limit = std::min(list_active_.size(), nlist);
+    for (size_t i = 0; i < limit; i++) {
+        if (list_active_[i]) {
+            count++;
+        }
+    }
+    return count;
+}
+
 size_t IndexIVF::split_large_clusters(
         size_t size_threshold,
         int split_factor,
@@ -2118,6 +2268,8 @@ size_t IndexIVF::split_large_clusters(
                size_threshold, split_factor);
     }
     
+    ensure_active_list_size(nlist);
+
     std::vector<size_t> clusters_to_split;
     
     // 找出需要分裂的聚类
@@ -2139,141 +2291,162 @@ size_t IndexIVF::split_large_clusters(
         printf("IndexIVF::split_large_clusters: found %zd clusters to split\n", clusters_to_split.size());
     }
     
+    size_t total_new_lists_needed = clusters_to_split.size() * (split_factor - 1);
+
+    std::vector<size_t> reusable_lists;
+    reusable_lists.reserve(total_new_lists_needed);
+    for (size_t list_no = 0; list_no < nlist; list_no++) {
+        if (!list_active_[list_no] && invlists->list_size(list_no) == 0) {
+            reusable_lists.push_back(list_no);
+        }
+    }
+
+    size_t appended_needed = total_new_lists_needed > reusable_lists.size()
+            ? total_new_lists_needed - reusable_lists.size()
+            : 0;
+
+    ArrayInvertedLists* array_il = dynamic_cast<ArrayInvertedLists*>(invlists);
+    if (appended_needed > 0) {
+        FAISS_THROW_IF_NOT_MSG(
+                array_il,
+                "IndexIVF::split_large_clusters requires ArrayInvertedLists to grow nlist dynamically");
+        size_t old_nlist = nlist;
+        size_t new_total = nlist + appended_needed;
+        array_il->resize_nlist(new_total);
+        ensure_active_list_size(new_total, 0);
+
+        std::vector<float> sentinel(d);
+        fill_inactive_centroid(sentinel.data());
+        for (size_t id = old_nlist; id < new_total; id++) {
+            update_quantizer_centroid(id, sentinel.data());
+            list_active_[id] = 0;
+            reusable_lists.push_back(id);
+        }
+        nlist = new_total;
+    } else {
+        ensure_active_list_size(nlist);
+    }
+
+    auto acquire_list = [&](std::vector<size_t>& pool) -> size_t {
+        FAISS_THROW_IF_NOT_MSG(!pool.empty(), "No available inverted list slot for split operation");
+        size_t id = pool.back();
+        pool.pop_back();
+        list_active_[id] = 1;
+        if (invlists->list_size(id) > 0) {
+            invlists->resize(id, 0);
+        }
+        return id;
+    };
+
+    size_t total_vectors_to_reassign = 0;
+    for (size_t list_no : clusters_to_split) {
+        total_vectors_to_reassign += invlists->list_size(list_no);
+    }
+
+    std::vector<float> vectors_to_readd;
+    std::vector<idx_t> ids_to_readd;
+    std::vector<idx_t> coarse_assignments;
+    vectors_to_readd.reserve(total_vectors_to_reassign * d);
+    ids_to_readd.reserve(total_vectors_to_reassign);
+    coarse_assignments.reserve(total_vectors_to_reassign);
+
     size_t n_split = 0;
-    std::vector<std::vector<float>> new_centroids_to_add;  // 每个元素包含 split_factor - 1 个新质心
-    std::vector<idx_t> all_ids_to_reassign;
-    std::vector<float> all_vectors_to_reassign;
-    std::unordered_set<idx_t> ids_to_remove_set;  // 用于快速查找需要移除的ID
-    
-    // 第一阶段：收集所有需要分裂的聚类的信息
+
     for (size_t list_no : clusters_to_split) {
         size_t list_size = invlists->list_size(list_no);
-        
+        if (list_size == 0) {
+            continue;
+        }
+
         if (verbose) {
             printf("IndexIVF::split_large_clusters: analyzing cluster %zd (size=%zd)\n", list_no, list_size);
         }
-        
-        // 1. 获取该聚类的所有向量和ID
+
         std::vector<float> cluster_vectors(list_size * d);
         std::vector<idx_t> cluster_ids(list_size);
-        
-        InvertedLists::ScopedCodes codes(invlists, list_no);
-        InvertedLists::ScopedIds ids(invlists, list_no);
-        
-        for (size_t offset = 0; offset < list_size; offset++) {
-            cluster_ids[offset] = ids[offset];
-            reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
-        }
-        
-        // 2. 使用k-means将聚类分裂成split_factor个子聚类
-        Clustering clus(d, split_factor, cp);
-        clus.verbose = false;
-        clus.niter = 10;  // 减少迭代次数以提高速度
-        
-        IndexFlatL2 assigner(d);
-        clus.train(list_size, cluster_vectors.data(), assigner);
-        
-        // 3. 保存新质心：只保存 split_factor - 1 个新质心（第一个子聚类的质心保留在原位置，不替换）
-        // 注意：为了简化实现，我们不替换原来的质心，只添加新质心
-        // 这样 quantizer->ntotal 会增加 n_split * (split_factor - 1)，与 nlist 的增加一致
-        std::vector<float> new_centroids((split_factor - 1) * d);
-        for (int i = 1; i < split_factor; i++) {
-            memcpy(new_centroids.data() + (i - 1) * d,
-                   clus.centroids.data() + i * d,
-                   d * sizeof(float));
-        }
-        new_centroids_to_add.push_back(new_centroids);
-        
-        // 4. 收集需要重新分配的向量和ID
-        all_ids_to_reassign.insert(
-            all_ids_to_reassign.end(), cluster_ids.begin(), cluster_ids.end());
-        all_vectors_to_reassign.insert(
-            all_vectors_to_reassign.end(),
-            cluster_vectors.begin(),
-            cluster_vectors.end());
-        
-        // 添加到移除集合
-        for (idx_t id : cluster_ids) {
-            ids_to_remove_set.insert(id);
-        }
-        
-        n_split++;
-    }
-    
-    // 第二阶段：计算新的nlist大小并扩展invlists
-    size_t new_nlist = nlist + n_split * (split_factor - 1);
-    
-    if (new_nlist > nlist) {
-        // 创建新的ArrayInvertedLists
-        ArrayInvertedLists* new_invlists = new ArrayInvertedLists(new_nlist, code_size);
-        
-        // 迁移现有数据（排除需要重新分配的向量）
-        for (size_t i = 0; i < nlist; i++) {
-            size_t old_size = invlists->list_size(i);
-            if (old_size > 0) {
-                InvertedLists::ScopedCodes old_codes(invlists, i);
-                InvertedLists::ScopedIds old_ids(invlists, i);
-                
-                // 过滤掉需要移除的ID
-                std::vector<idx_t> filtered_ids;
-                std::vector<uint8_t> filtered_codes;
-                
-                for (size_t j = 0; j < old_size; j++) {
-                    if (ids_to_remove_set.find(old_ids[j]) == ids_to_remove_set.end()) {
-                        filtered_ids.push_back(old_ids[j]);
-                        filtered_codes.insert(
-                            filtered_codes.end(),
-                            old_codes.get() + j * code_size,
-                            old_codes.get() + (j + 1) * code_size);
-                    }
-                }
-                
-                if (!filtered_ids.empty()) {
-                    new_invlists->add_entries(i, filtered_ids.size(), filtered_ids.data(), filtered_codes.data());
-                }
+
+        {
+            InvertedLists::ScopedCodes codes(invlists, list_no);
+            InvertedLists::ScopedIds ids(invlists, list_no);
+            for (size_t offset = 0; offset < list_size; offset++) {
+                cluster_ids[offset] = ids[offset];
+                reconstruct_from_offset(
+                        list_no,
+                        offset,
+                        cluster_vectors.data() + offset * d);
             }
         }
-        
-        // 替换invlists（需要在调用前更新nlist，因为replace_invlists会检查il->nlist == nlist）
-        nlist = new_nlist;
-        replace_invlists(new_invlists, true);
-    } else {
-        // 如果不需要扩展，直接从旧列表中移除需要重新分配的向量
-        // 注意：这里直接调用 direct_map.remove_ids 而不是 remove_ids，
-        // 以避免触发 maintain_affected_clusters 造成递归调用
-        if (!all_ids_to_reassign.empty()) {
-            IDSelectorArray sel(all_ids_to_reassign.size(), all_ids_to_reassign.data());
-            size_t nremove = direct_map.remove_ids(sel, invlists);
-            ntotal -= nremove;
+
+        Clustering clus(d, split_factor, cp);
+        clus.verbose = false;
+        clus.niter = std::min<int>(clus.niter, 10);
+
+        IndexFlatL2 assigner(d);
+        clus.train(list_size, cluster_vectors.data(), assigner);
+
+        std::vector<float> local_dis(list_size);
+        std::vector<idx_t> local_assign(list_size);
+        assigner.search(
+                list_size,
+                cluster_vectors.data(),
+                1,
+                local_dis.data(),
+                local_assign.data());
+
+        std::vector<size_t> local_to_list(split_factor);
+        local_to_list[0] = list_no;
+        list_active_[list_no] = 1;
+        update_quantizer_centroid(list_no, clus.centroids.data());
+
+        for (int sub = 1; sub < split_factor; sub++) {
+            size_t new_list_id = acquire_list(reusable_lists);
+            local_to_list[sub] = new_list_id;
+            update_quantizer_centroid(
+                new_list_id, clus.centroids.data() + sub * d);
         }
+
+        if (direct_map.type == DirectMap::Hashtable) {
+            IDSelectorArray sel(list_size, cluster_ids.data());
+            size_t nremove = direct_map.remove_ids(sel, invlists);
+            FAISS_THROW_IF_NOT(nremove == list_size);
+            ntotal -= nremove;
+        } else {
+            invlists->resize(list_no, 0);
+            ntotal -= list_size;
+        }
+
+        vectors_to_readd.insert(
+                vectors_to_readd.end(),
+                cluster_vectors.begin(),
+                cluster_vectors.end());
+        ids_to_readd.insert(
+                ids_to_readd.end(), cluster_ids.begin(), cluster_ids.end());
+
+        for (size_t i = 0; i < list_size; i++) {
+            idx_t dest_list = static_cast<idx_t>(local_to_list[local_assign[i]]);
+            coarse_assignments.push_back(dest_list);
+        }
+
+        n_split++;
     }
-    
-    // 第三阶段：添加新质心到quantizer
-    // 注意：我们不替换原来的质心，只添加新质心
-    // 这样 quantizer->ntotal 会增加 n_split * (split_factor - 1)，与 nlist 的增加一致
-    for (const auto& centroids : new_centroids_to_add) {
-        quantizer->add(split_factor - 1, centroids.data());
+
+    if (!vectors_to_readd.empty()) {
+        add_core(
+                ids_to_readd.size(),
+                vectors_to_readd.data(),
+                ids_to_readd.data(),
+                coarse_assignments.data(),
+                nullptr,
+                false);
     }
-    
-    // 验证 quantizer->ntotal == nlist
-    if (quantizer->ntotal != nlist) {
-        FAISS_THROW_IF_NOT_MSG(
-            quantizer->ntotal == nlist,
-            "quantizer->ntotal must equal nlist after splitting");
-    }
-    
-    // 第四阶段：重新添加向量（会自动分配到新的聚类）
-    if (!all_ids_to_reassign.empty()) {
-        add_with_ids(
-            all_ids_to_reassign.size(),
-            all_vectors_to_reassign.data(),
-            all_ids_to_reassign.data());
-    }
-    
+
     if (verbose) {
-        printf("IndexIVF::split_large_clusters: split %zd clusters, new nlist=%zd\n", n_split, nlist);
+        printf(
+                "IndexIVF::split_large_clusters: split %zd clusters, new nlist=%zd\n",
+                n_split,
+                nlist);
     }
-    
+
     return n_split;
 }
 
@@ -2288,11 +2461,16 @@ size_t IndexIVF::merge_small_clusters(
         printf("IndexIVF::merge_small_clusters: checking clusters with threshold=%zd\n", size_threshold);
     }
     
+    ensure_active_list_size(nlist);
+
     std::vector<size_t> small_clusters;
     
     // 找出需要合并的小聚类
     for (size_t list_no = 0; list_no < nlist; list_no++) {
         size_t list_size = invlists->list_size(list_no);
+        if (!list_active_[list_no]) {
+            continue;
+        }
         if (list_size < size_threshold && list_size >= min_merge_size) {
             small_clusters.push_back(list_no);
         }
@@ -2385,6 +2563,16 @@ size_t IndexIVF::merge_small_clusters(
         // 注意：这里需要强制分配到nearest_list_no，禁用auto_maintain以避免递归调用
         std::vector<idx_t> forced_assign(list_size, nearest_list_no);
         add_core(list_size, cluster_vectors.data(), cluster_ids.data(), forced_assign.data(), nullptr, false);
+
+        // 更新目标聚类质心
+        recompute_cluster_centroid(nearest_list_no, true);
+
+        // 将当前聚类标记为不再活跃，设置哨兵质心以避免被选中
+        list_active_[small_list_no] = 0;
+        std::vector<float> inactive_centroid(d);
+        fill_inactive_centroid(inactive_centroid.data());
+        update_quantizer_centroid(small_list_no, inactive_centroid.data());
+        invlists->resize(small_list_no, 0);
         
         n_merged++;
     }
@@ -2446,6 +2634,11 @@ bool IndexIVF::recompute_cluster_centroid(size_t list_no, bool update_quantizer)
     FAISS_THROW_IF_NOT(is_trained);
     FAISS_THROW_IF_NOT(invlists != nullptr);
     FAISS_THROW_IF_NOT(list_no < nlist);
+
+    ensure_active_list_size(nlist);
+    if (!list_active_[list_no]) {
+        return false;
+    }
     
     size_t list_size = invlists->list_size(list_no);
     if (list_size == 0) {
@@ -2526,6 +2719,11 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
     FAISS_THROW_IF_NOT(is_trained);
     FAISS_THROW_IF_NOT(invlists != nullptr);
     FAISS_THROW_IF_NOT(list_no < nlist);
+
+    ensure_active_list_size(nlist);
+    if (!list_active_[list_no]) {
+        return stats;
+    }
     
     // 确保 quantizer 和 nlist 同步
     // 如果不同步，可能会导致访问越界
@@ -2559,13 +2757,17 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
         // 获取该聚类的所有向量和ID
         std::vector<float> cluster_vectors(list_size * d);
         std::vector<idx_t> cluster_ids(list_size);
-        
-        InvertedLists::ScopedCodes codes(invlists, list_no);
-        InvertedLists::ScopedIds ids(invlists, list_no);
-        
-        for (size_t offset = 0; offset < list_size; offset++) {
-            cluster_ids[offset] = ids[offset];
-            reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+
+        {
+            // 限定 ScopedCodes/ScopedIds 生命周期，防止在 replace_invlists
+            // 后访问被释放的倒排列表
+            InvertedLists::ScopedCodes codes(invlists, list_no);
+            InvertedLists::ScopedIds ids(invlists, list_no);
+
+            for (size_t offset = 0; offset < list_size; offset++) {
+                cluster_ids[offset] = ids[offset];
+                reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+            }
         }
         
         // 使用k-means将聚类分裂成split_factor个子聚类
@@ -2587,6 +2789,12 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
         // 扩展invlists
         size_t new_nlist = nlist + (split_factor - 1);
         ArrayInvertedLists* new_invlists = new ArrayInvertedLists(new_nlist, code_size);
+        
+        // CRITICAL FIX: Remove split cluster vectors from direct_map before replacing invlists
+        // This prevents stale entries in direct_map after invlists replacement
+        IDSelectorArray split_sel(list_size, cluster_ids.data());
+        direct_map.remove_ids(split_sel, invlists);
+        ntotal -= list_size;
         
         // 迁移现有数据（排除需要重新分配的向量）
         std::unordered_set<idx_t> ids_to_remove_set(cluster_ids.begin(), cluster_ids.end());
@@ -2615,9 +2823,18 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
             }
         }
         
-        // 替换invlists
+        // 替换invlists并重建direct_map
+        // After replacing invlists, the old direct_map entries have invalid offsets
+        // We need to rebuild the direct_map from the new invlists
         nlist = new_nlist;
         replace_invlists(new_invlists, true);
+        
+        // Rebuild direct_map from new invlists
+        // This ensures all (list_no, offset) pairs are correct for the new structure
+        DirectMap::Type old_dm_type = direct_map.type;
+        if (old_dm_type != DirectMap::NoMap) {
+            direct_map.set_type(old_dm_type, invlists, ntotal);
+        }
         
         // 添加新质心到quantizer
         quantizer->add(split_factor - 1, new_centroids.data());
@@ -2629,11 +2846,18 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
         
         // 更新原聚类的质心（使用第一个子聚类的质心）
         // 检查 list_no 是否在 quantizer 的有效范围内
+        // CRITICAL FIX: Get pointer AFTER all add operations to avoid stale pointer
         if (list_no < quantizer->ntotal) {
             IndexFlat* flat_quantizer = dynamic_cast<IndexFlat*>(quantizer);
             if (flat_quantizer) {
+                // Get pointer AFTER quantizer->add to ensure it's not stale
                 float* quantizer_data = flat_quantizer->get_xb();
-                memcpy(quantizer_data + list_no * d, clus.centroids.data(), d * sizeof(float));
+                // Verify the pointer is valid and within bounds
+                if (quantizer_data && (list_no + 1) * d <= flat_quantizer->ntotal * d) {
+                    memcpy(quantizer_data + list_no * d, clus.centroids.data(), d * sizeof(float));
+                } else if (verbose) {
+                    printf("Warning: maintain_cluster: invalid quantizer_data pointer or out of bounds access\n");
+                }
             }
         } else if (verbose) {
             printf("Warning: maintain_cluster: list_no %zd >= quantizer->ntotal %zd, skipping centroid update\n",
@@ -2751,14 +2975,17 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
             std::vector<float> cluster_vectors(list_size * d);
             std::vector<idx_t> cluster_ids(list_size);
             
-            InvertedLists::ScopedCodes codes(invlists, list_no);
-            InvertedLists::ScopedIds ids(invlists, list_no);
-            
-            // 安全地获取向量和ID
-            // 注意：list_size 已经在前面检查过了，所以这里应该是安全的
-            for (size_t offset = 0; offset < list_size; offset++) {
-                cluster_ids[offset] = ids[offset];
-                reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+            {
+                // 同样限制 ScopedCodes/ScopedIds 生命周期，避免后续结构修改
+                InvertedLists::ScopedCodes codes(invlists, list_no);
+                InvertedLists::ScopedIds ids(invlists, list_no);
+
+                // 安全地获取向量和ID
+                // 注意：list_size 已经在前面检查过了，所以这里应该是安全的
+                for (size_t offset = 0; offset < list_size; offset++) {
+                    cluster_ids[offset] = ids[offset];
+                    reconstruct_from_offset(list_no, offset, cluster_vectors.data() + offset * d);
+                }
             }
             
             // 从小聚类中移除向量
@@ -2805,11 +3032,15 @@ IndexIVF::ClusterMaintenanceStats IndexIVF::maintain_cluster(
 }
 
 void IndexIVF::maintain_affected_clusters(
-    const std::unordered_set<size_t>& affected_clusters,
-    bool update_quantizer) {
+        const std::unordered_set<size_t>& affected_clusters,
+        bool update_quantizer,
+        const std::unordered_map<size_t, size_t>* change_counts,
+        float min_change_ratio) {
 if (affected_clusters.empty()) {
     return;
 }
+
+    const float ratio_threshold = std::max(0.0f, min_change_ratio);
 
 // CHANGE: Add sync check to prevent errors
 if (quantizer->ntotal != nlist) {
@@ -2830,7 +3061,10 @@ if (quantizer->ntotal != nlist) {
 
 // 计算平均聚类大小，用于确定阈值
 size_t total_vectors = ntotal;
-size_t avg_cluster_size = (nlist > 0 && total_vectors > 0) ? (total_vectors / nlist) : 0;
+size_t active_lists = active_list_count();
+size_t avg_cluster_size = (active_lists > 0 && total_vectors > 0)
+    ? (total_vectors / active_lists)
+    : 0;
 
 // 设置阈值
 size_t split_threshold = avg_cluster_size * 3;
@@ -2852,6 +3086,24 @@ for (size_t list_no : clusters_to_maintain) {
     // 在每次迭代时检查 list_no 是否仍然有效
     // 如果 nlist 在维护过程中增加了，某些 list_no 可能仍然有效
     if (list_no < nlist) {
+        if (change_counts && ratio_threshold > 0.0f) {
+            auto it = change_counts->find(list_no);
+            size_t changed = it != change_counts->end() ? it->second : 0;
+            if (changed == 0) {
+                continue;
+            }
+            size_t list_size = invlists->list_size(list_no);
+            double ratio = list_size > 0
+                    ? double(changed) / double(list_size)
+                    : 1.0;
+            if (ratio < ratio_threshold) {
+                if (verbose) {
+                    printf("maintain_affected_clusters: skip cluster %zd (ratio %.4f < %.4f)\n",
+                           list_no, ratio, ratio_threshold);
+                }
+                continue;
+            }
+        }
         // 在调用 maintain_cluster 之前，再次检查 quantizer 和 nlist 是否同步
         // 如果不同步，跳过这个聚类
         if (quantizer->ntotal == nlist) {
