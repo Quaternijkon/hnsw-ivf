@@ -338,6 +338,33 @@ struct IndexIVF : Index, IndexIVFInterface {
             QueryLatencyStats* per_query_stats = nullptr
         ) const;
 
+    /** Search function optimized for HNSW quantizer
+     *
+     * This function provides specialized implementations for IVF search
+     * when using HNSW as the coarse quantizer. It leverages HNSW's
+     * characteristics such as:
+     * - Better locality of reference from HNSW's graph structure
+     * - Batched processing for improved cache efficiency
+     * - Adaptive parallel strategies optimized for HNSW quantization
+     * - Optional two-phase search combining HNSW graph traversal with IVF
+     *
+     * @param n          number of query vectors
+     * @param x          query vectors (n * d)
+     * @param k          number of nearest neighbors to return
+     * @param distances  output distances (n * k)
+     * @param labels     output labels (n * k)
+     * @param params     optional search parameters
+     * @param hnsw_ef_search  efSearch parameter for HNSW quantizer (0 = use default)
+     */
+    void search_with_hnsw(
+            idx_t n,
+            const float* x,
+            idx_t k,
+            float* distances,
+            idx_t* labels,
+            const SearchParameters* params = nullptr,
+            int hnsw_ef_search = 0) const;
+
     void range_search(
             idx_t n,
             const float* x,
