@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -908,6 +909,12 @@ void IndexIVF::search_with_hnsw(
         idx_t* labels,
         const SearchParameters* params_in) const {
     FAISS_THROW_IF_NOT(k > 0);
+    FAISS_THROW_IF_NOT_MSG(n >= 0, "Invalid number of queries");
+    
+    // Handle empty query case
+    if (n == 0) {
+        return;
+    }
     
     // Check if quantizer is HNSW
     const IndexHNSW* hnsw_quantizer = dynamic_cast<const IndexHNSW*>(quantizer);
@@ -951,9 +958,21 @@ void IndexIVF::search_with_hnsw(
     
     // Determine optimal parallel strategy based on workload
     const int max_threads = omp_get_max_threads();
+    
+    // Threshold for maximum nprobe to use batch quantization.
+    // When nprobe exceeds this value, the IVF scanning overhead dominates
+    // and chunked processing provides better cache utilization.
+    constexpr size_t kMaxNprobeForBatchQuant = 64;
+    
+    // Minimum query multiplier for batch quantization.
+    // We need at least this many queries per thread to benefit from
+    // batch quantization overhead. Value of 2 ensures each thread has
+    // meaningful work without excessive context switching.
+    constexpr int kMinQueriesPerThreadForBatch = 2;
+    
     const bool use_batch_quantization = 
-        (n >= max_threads * 2) &&  // Enough queries to benefit from parallelism
-        (nprobe_val <= 64);        // Not too many probes
+        (n >= max_threads * kMinQueriesPerThreadForBatch) &&  // Enough queries to benefit from parallelism
+        (nprobe_val <= kMaxNprobeForBatchQuant);              // Not too many probes
     
     // Allocate memory for coarse quantization results
     std::unique_ptr<idx_t[]> coarse_idx(new idx_t[n * nprobe_val]);
@@ -1018,11 +1037,29 @@ void IndexIVF::search_with_hnsw(
         
         // Determine chunk size based on efSearch and available threads
         // Larger efSearch means HNSW does more work per query, so use smaller chunks
+        // 
+        // kBaseChunkMultiplier: Base multiplier for chunk size calculation.
+        // This represents the baseline work unit per thread when efSearch is minimal.
+        // Value of 128.0 is empirically chosen to balance between parallelism overhead
+        // and cache efficiency for typical HNSW graph sizes.
+        //
+        // kMinEfSearch: Minimum efSearch value to prevent division by zero and
+        // to cap the chunk size for very small efSearch values. Value of 16 is
+        // chosen as it represents a reasonable lower bound for effective HNSW search.
+        //
+        // kMinChunkSize: Minimum chunk size to prevent inefficient single-query
+        // chunks when efSearch is very large.
+        constexpr double kBaseChunkMultiplier = 128.0;
+        constexpr int kMinEfSearch = 16;
+        constexpr idx_t kMinChunkSize = 4;
+        
+        // Use floating-point division to prevent truncation to 0 for large efSearch
+        const double chunk_scale = kBaseChunkMultiplier / static_cast<double>(std::max(efSearch, kMinEfSearch));
         const idx_t chunk_size = std::max<idx_t>(
-            1,
+            kMinChunkSize,
             std::min<idx_t>(
                 n,
-                static_cast<idx_t>(max_threads * (128 / std::max(efSearch, 16)))
+                static_cast<idx_t>(std::ceil(max_threads * chunk_scale))
             )
         );
         

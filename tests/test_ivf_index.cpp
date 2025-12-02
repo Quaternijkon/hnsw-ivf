@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <faiss/IndexFlat.h>
+#include <faiss/IndexHNSW.h>
 #include <faiss/IndexIVFFlat.h>
 #include <faiss/impl/FaissAssert.h>
 
@@ -254,7 +255,6 @@ TEST(IVF, list_context) {
 }
 
 // Test for search_with_hnsw functionality
-#include <faiss/IndexHNSW.h>
 
 TEST(IVF, search_with_hnsw) {
     // Test search_with_hnsw with HNSW quantizer
