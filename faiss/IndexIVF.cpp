@@ -48,6 +48,9 @@ struct Timer {
 
 namespace {
 constexpr float kClusterChangeRatio = 0.05f;
+// Skip automatic maintenance for large bulk additions to avoid slowing
+// down initial dataset ingestion (e.g., loading SIFT1M base vectors).
+constexpr size_t kAutoMaintainMaxBatch = 200000;
 }
 
 namespace faiss {
@@ -212,7 +215,12 @@ void IndexIVF::add_with_ids(idx_t n, const float* x, const idx_t* xids) {
    
     std::unique_ptr<idx_t[]> coarse_idx(new idx_t[n]);
     quantizer->assign(n, x, coarse_idx.get());
-    add_core(n, x, xids, coarse_idx.get(), nullptr, true);  // CHANGE: Pass true for auto_maintain
+
+    // Large ingestions are handled in recursive batches, so only allow
+    // automatic maintenance when the top-level request itself is small
+    // enough to stay below the intended threshold.
+    bool allow_maintain = static_cast<size_t>(n) <= kAutoMaintainMaxBatch;
+    add_core(n, x, xids, coarse_idx.get(), nullptr, allow_maintain);
 }
 
 void IndexIVF::add_sa_codes(idx_t n, const uint8_t* codes, const idx_t* xids) {
@@ -246,19 +254,20 @@ void IndexIVF::add_core(
                        i0,
                        i1);
             }
-            add_core(
+                add_core(
                     i1 - i0,
                     x + i0 * d,
                     xids ? xids + i0 : nullptr,
                     coarse_idx + i0,
                     inverted_list_context,
-                    auto_maintain);
+                    false);
         }
         return;
     }
     FAISS_THROW_IF_NOT(coarse_idx);
     FAISS_THROW_IF_NOT(is_trained);
     direct_map.check_can_add(xids);
+    const idx_t prev_ntotal = ntotal;
 
     size_t nadd = 0, nminus1 = 0;
 
@@ -314,9 +323,13 @@ void IndexIVF::add_core(
     }
 
     ntotal += n;
-    
+
+    const bool should_auto_maintain =
+            auto_maintain && prev_ntotal > 0 &&
+            static_cast<size_t>(n) <= kAutoMaintainMaxBatch;
+
     // 收集被插入的聚类，用于后续维护
-    if (auto_maintain) {
+    if (should_auto_maintain) {
         std::unordered_set<size_t> affected_clusters;
         std::unordered_map<size_t, size_t> change_counts;
         for (size_t i = 0; i < n; i++) {

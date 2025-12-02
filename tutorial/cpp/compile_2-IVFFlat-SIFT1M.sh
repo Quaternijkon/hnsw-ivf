@@ -5,11 +5,11 @@
 SIFT1M_DIR="${1:-sift1M}"
 
 # 编译命令
-g++ -std=c++17 -O3 -o 2-IVFFlat-SIFT1M 2-IVFFlat-SIFT1M.cpp \
+g++ -std=c++17 -O3 -march=native -mavx2 -mfma -fopenmp -o 2-IVFFlat-SIFT1M 2-IVFFlat-SIFT1M.cpp \
     -I ../.. \
     -L ../../build/faiss \
     -Wl,-rpath,../../build/faiss \
-    -lfaiss -lopenblas -fopenmp
+    -lfaiss -lopenblas
 
 # 检查编译是否成功
 if [ $? -eq 0 ]; then
@@ -48,10 +48,6 @@ if [ $? -eq 0 ]; then
     echo "使用 SIFT1M 数据集目录: $SIFT1M_DIR"
     echo "运行程序..."
     echo ""
-    
-    # 设置环境变量
-    export OPENBLAS_NUM_THREADS=1
-    export OMP_NUM_THREADS=4
     
     # 运行程序
     ./2-IVFFlat-SIFT1M "$SIFT1M_DIR"

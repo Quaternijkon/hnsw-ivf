@@ -38,3 +38,4 @@ tutorial/cpp/disk_workspace
 tutorial/cpp/memory_workspace
 tutorial/cpp/benchmark-hnsw-ivf/indices
 tutorial/ondisk/ondisk_demo_faiss/sift1M
+tutorial/cpp/sift

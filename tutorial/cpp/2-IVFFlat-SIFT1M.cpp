@@ -2,7 +2,7 @@
  * @Author: Quaternijkon quaternijkon@mail.ustc.edu.cn
  * @Date: 2025-02-07 06:29:50
  * @LastEditors: Quaternijkon quaternijkon@mail.ustc.edu.cn
- * @LastEditTime: 2025-11-18 10:13:58
+ * @LastEditTime: 2025-12-01 09:28:18
  * @FilePath: /faiss/tutorial/cpp/2-IVFFlat-SIFT1M.cpp
  * @Description: 基于 SIFT1M 数据集验证 IndexIVF 自动聚类维护功能
  */
@@ -20,6 +20,8 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <thread>
+#include <utility>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <omp.h>
@@ -30,6 +32,9 @@
 #include <faiss/invlists/DirectMap.h>
 
 using idx_t = faiss::idx_t;
+
+extern "C" void openblas_set_num_threads(int num_threads);
+extern "C" int openblas_get_num_threads();
 
 /*****************************************************
  * I/O functions for fvecs and ivecs
@@ -125,14 +130,32 @@ float compute_recall_at_k(
 
 int main(int argc, char* argv[]) {
     double t0 = elapsed();
+    std::vector<std::pair<std::string, double>> stage_times;
+    stage_times.reserve(16);
     
-    // 设置 OpenMP 线程数
-    int num_threads = 4;
+    // 设置 OpenMP 线程数（默认使用硬件并发度，可通过 FAISS_OMP_THREADS 环境变量覆盖）
+    constexpr int kDefaultThreads = 20;
+    int num_threads = 0;
+    if (const char* env_threads = getenv("FAISS_OMP_THREADS")) {
+        num_threads = atoi(env_threads);
+    }
+    if (num_threads <= 0) {
+        num_threads = kDefaultThreads;
+    }
+    int hw = static_cast<int>(std::thread::hardware_concurrency());
+    if (hw > 0) {
+        num_threads = std::min(num_threads, hw);
+    }
+    if (num_threads <= 0) {
+        num_threads = omp_get_max_threads();
+    }
+    num_threads = std::max(1, num_threads);
     omp_set_num_threads(num_threads);
     char omp_threads_str[32];
     snprintf(omp_threads_str, sizeof(omp_threads_str), "%d", num_threads);
-    setenv("OPENBLAS_NUM_THREADS", "1", 1);
     setenv("OMP_NUM_THREADS", omp_threads_str, 1);
+    openblas_set_num_threads(num_threads);
+    printf("OpenBLAS 线程数: %d\n", openblas_get_num_threads());
     
     printf("OpenMP 线程数: %d\n", omp_get_max_threads());
     
@@ -146,7 +169,10 @@ int main(int argc, char* argv[]) {
     // ========== 加载训练集 ==========
     printf("[%.3f s] 加载训练集...\n", elapsed() - t0);
     size_t d, nt;
+    double load_train_t0 = elapsed();
     float* xt = fvecs_read((std::string(sift1m_dir) + "/sift_learn.fvecs").c_str(), &d, &nt);
+    double load_train_time = elapsed() - load_train_t0;
+    stage_times.push_back({"load_train", load_train_time});
     printf("  维度: %zd, 训练向量数: %zd\n", d, nt);
     
     // ========== 创建索引 ==========
@@ -165,7 +191,10 @@ int main(int argc, char* argv[]) {
     // ========== 训练索引 ==========
     printf("\n[%.3f s] 训练索引...\n", elapsed() - t0);
     assert(!index.is_trained);
+    double train_t0 = elapsed();
     index.train(nt, xt);
+    double train_time = elapsed() - train_t0;
+    stage_times.push_back({"train_index", train_time});
     assert(index.is_trained);
     printf("  训练完成\n");
     delete[] xt;
@@ -178,7 +207,10 @@ int main(int argc, char* argv[]) {
     // ========== 加载数据库 ==========
     printf("\n[%.3f s] 加载数据库...\n", elapsed() - t0);
     size_t nb, d2;
+    double load_base_t0 = elapsed();
     float* xb = fvecs_read((std::string(sift1m_dir) + "/sift_base.fvecs").c_str(), &d2, &nb);
+    double load_base_time = elapsed() - load_base_t0;
+    stage_times.push_back({"load_base", load_base_time});
     assert(d == d2 || !"数据库维度与训练集不一致");
     printf("  数据库向量数: %zd\n", nb);
     
@@ -188,25 +220,34 @@ int main(int argc, char* argv[]) {
     for (size_t i = 0; i < nb; i++) {
         ids_initial[i] = i;
     }
+    double add_initial_t0 = elapsed();
     index.add_with_ids(nb, xb, ids_initial);
+    double add_initial_time = elapsed() - add_initial_t0;
+    stage_times.push_back({"add_initial", add_initial_time});
     printf("  已添加 %zd 个向量，索引总数: %zd\n", nb, index.ntotal);
     delete[] ids_initial;
     
     // ========== 加载查询集和 groundtruth ==========
     printf("\n[%.3f s] 加载查询集...\n", elapsed() - t0);
     size_t nq, d3;
+    double load_query_t0 = elapsed();
     float* xq = fvecs_read((std::string(sift1m_dir) + "/sift_query.fvecs").c_str(), &d3, &nq);
+    double load_query_time = elapsed() - load_query_t0;
+    stage_times.push_back({"load_queries", load_query_time});
     assert(d == d3 || !"查询集维度不一致");
     printf("  查询向量数: %zd\n", nq);
     
     printf("\n[%.3f s] 加载 groundtruth...\n", elapsed() - t0);
     size_t k_gt;
+    double load_gt_t0 = elapsed();
     int* gt_int = ivecs_read((std::string(sift1m_dir) + "/sift_groundtruth.ivecs").c_str(), &k_gt, &nq);
     idx_t* gt = new idx_t[k_gt * nq];
     for (size_t i = 0; i < k_gt * nq; i++) {
         gt[i] = gt_int[i];
     }
     delete[] gt_int;
+    double load_gt_time = elapsed() - load_gt_t0;
+    stage_times.push_back({"load_groundtruth", load_gt_time});
     printf("  Groundtruth 每个查询的最近邻数: %zd\n", k_gt);
     
     // ========== 初始搜索和评估 ==========
@@ -217,6 +258,7 @@ int main(int argc, char* argv[]) {
     double search_t0 = elapsed();
     index.search(nq, xq, k, D_initial, I_initial);
     double search_time = elapsed() - search_t0;
+    stage_times.push_back({"initial_search", search_time});
     
     float recall_1_initial = compute_recall_at_k(I_initial, gt, nq, 1, k_gt);
     float recall_10_initial = compute_recall_at_k(I_initial, gt, nq, 10, k_gt);
@@ -245,6 +287,7 @@ int main(int argc, char* argv[]) {
     double insert_t0 = elapsed();
     index.add_with_ids(n_insert, x_insert, ids_insert);
     double insert_time = elapsed() - insert_t0;
+    stage_times.push_back({"demo_insert", insert_time});
     
     printf("  插入了 %zd 个向量，索引总数: %zd\n", n_insert, index.ntotal);
     printf("  插入时间: %.3f s\n", insert_time);
@@ -269,6 +312,7 @@ int main(int argc, char* argv[]) {
     double update_t0 = elapsed();
     index.update_vectors(n_update, ids_update, x_update);
     double update_time = elapsed() - update_t0;
+    stage_times.push_back({"demo_update", update_time});
     
     printf("  更新了 %zd 个向量\n", n_update);
     printf("  更新时间: %.3f s\n", update_time);
@@ -288,6 +332,7 @@ int main(int argc, char* argv[]) {
     double delete_t0 = elapsed();
     size_t n_removed = index.remove_ids(selector);
     double delete_time = elapsed() - delete_t0;
+    stage_times.push_back({"demo_delete", delete_time});
     
     printf("  删除了 %zd 个向量，索引总数: %zd\n", n_removed, index.ntotal);
     printf("  删除时间: %.3f s\n", delete_time);
@@ -339,6 +384,7 @@ int main(int argc, char* argv[]) {
     search_t0 = elapsed();
     index.search(nq, xq, k, D_final, I_final);
     search_time = elapsed() - search_t0;
+    stage_times.push_back({"final_search", search_time});
     
     float recall_1_final = compute_recall_at_k(I_final, gt, nq, 1, k_gt);
     float recall_10_final = compute_recall_at_k(I_final, gt, nq, 10, k_gt);
@@ -349,12 +395,22 @@ int main(int argc, char* argv[]) {
            recall_1_final, recall_1_initial, recall_1_final - recall_1_initial);
     printf("  Recall@10:  %.4f (初始: %.4f, 变化: %+.4f)\n", 
            recall_10_final, recall_10_initial, recall_10_final - recall_10_initial);
-    printf("  Recall@100: %.4f (初始: %.4f, 变化: %+.4f)\n", 
-           recall_100_final, recall_100_initial, recall_100_final - recall_100_initial);
+        printf("  Recall@100: %.4f (初始: %.4f, 变化: %+.4f)\n", 
+            recall_100_final, recall_100_initial, recall_100_final - recall_100_initial);
+
+        double total_time = elapsed() - t0;
+        double accounted = 0.0;
+        printf("\n[%.3f s] ========== 阶段耗时统计 ==========\n", total_time);
+        for (const auto& kv : stage_times) {
+         accounted += kv.second;
+         printf("  %-20s %.3f s\n", kv.first.c_str(), kv.second);
+        }
+        printf("  %-20s %.3f s\n", "accounted_total", accounted);
+        printf("  %-20s %.3f s\n", "unaccounted", total_time - accounted);
     
-    // ========== 总结 ==========
-    printf("\n[%.3f s] ========== 总结 ==========\n", elapsed() - t0);
-    printf("  总耗时: %.3f s\n", elapsed() - t0);
+        // ========== 总结 ==========
+        printf("\n[%.3f s] ========== 总结 ==========\n", total_time);
+        printf("  总耗时: %.3f s\n", total_time);
     printf("  插入操作: %.3f s\n", insert_time);
     printf("  更新操作: %.3f s\n", update_time);
     printf("  删除操作: %.3f s\n", delete_time);
