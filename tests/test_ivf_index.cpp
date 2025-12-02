@@ -276,7 +276,9 @@ TEST(IVF, search_with_hnsw) {
 
     // Create IVF index with HNSW quantizer
     faiss::IndexIVFFlat index(&hnsw_quantizer, d, nlist);
-    index.own_fields = false;  // Don't own quantizer
+    // Disable ownership to prevent the index from deallocating
+    // the stack-allocated quantizer when the index is destroyed
+    index.own_fields = false;
     
     // Generate training data
     constexpr size_t nt = 2000;
@@ -350,6 +352,8 @@ TEST(IVF, search_with_hnsw_fallback) {
     // Create flat quantizer (not HNSW)
     faiss::IndexFlatL2 flat_quantizer(d);
     faiss::IndexIVFFlat index(&flat_quantizer, d, nlist);
+    // Disable ownership to prevent the index from deallocating
+    // the stack-allocated quantizer when the index is destroyed
     index.own_fields = false;
 
     // Generate and train

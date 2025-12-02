@@ -351,9 +351,9 @@ struct IndexIVF : Index, IndexIVFInterface {
      * 
      * Falls back to regular search if quantizer is not HNSW.
      * 
-     * @param n      number of vectors to search
+     * @param n      number of vectors to search (must be >= 0, returns immediately if 0)
      * @param x      query vectors (size n * d)
-     * @param k      number of neighbors to search
+     * @param k      number of neighbors to search (must be > 0)
      * @param distances  output distances (size n * k)
      * @param labels     output labels (size n * k)
      * @param params     search parameters (optional)
