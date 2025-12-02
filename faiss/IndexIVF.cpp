@@ -27,6 +27,7 @@
 #include <faiss/utils/distances.h>
 
 #include <faiss/IndexFlat.h>
+#include <faiss/IndexHNSW.h>
 #include <faiss/Clustering.h>
 #include <faiss/invlists/InvertedLists.h>
 #include <faiss/invlists/DirectMap.h>
@@ -897,6 +898,205 @@ void IndexIVF::search_stats(
                                           per_query_stats[i].list_scan_us;
         }
     }
+}
+
+void IndexIVF::search_with_hnsw(
+        idx_t n,
+        const float* x,
+        idx_t k,
+        float* distances,
+        idx_t* labels,
+        const SearchParameters* params_in) const {
+    FAISS_THROW_IF_NOT(k > 0);
+    
+    // Check if quantizer is HNSW
+    const IndexHNSW* hnsw_quantizer = dynamic_cast<const IndexHNSW*>(quantizer);
+    if (!hnsw_quantizer) {
+        // Fall back to regular search if not HNSW quantizer
+        search(n, x, k, distances, labels, params_in);
+        return;
+    }
+    
+    const IVFSearchParameters* params = nullptr;
+    if (params_in) {
+        params = dynamic_cast<const IVFSearchParameters*>(params_in);
+        FAISS_THROW_IF_NOT_MSG(params, "IndexIVF params have incorrect type");
+    }
+    const size_t nprobe_val =
+            std::min(nlist, params ? params->nprobe : this->nprobe);
+    FAISS_THROW_IF_NOT(nprobe_val > 0);
+    
+    // Get HNSW parameters for optimization
+    const HNSW& hnsw = hnsw_quantizer->hnsw;
+    const int efSearch = hnsw.efSearch;
+    
+    /*
+     * HNSW-specific parallel search strategy:
+     * 
+     * Key insight: HNSW quantizer has different characteristics than flat/IVF quantizers:
+     * 1. HNSW search is already highly optimized with graph traversal
+     * 2. HNSW can benefit from batched queries due to graph locality
+     * 3. The quantization phase in HNSW has different compute characteristics
+     * 
+     * Optimization strategies:
+     * - Strategy 1: Batch-oriented quantization + parallel IVF scan
+     *   When nprobe is large, batch all queries through HNSW first,
+     *   then parallelize the IVF list scanning
+     * - Strategy 2: Query-parallel with shared graph cache
+     *   When n is large, parallelize over queries but share HNSW graph
+     *   traversal information
+     * - Strategy 3: Hybrid approach 
+     *   Dynamically choose based on workload characteristics
+     */
+    
+    // Determine optimal parallel strategy based on workload
+    const int max_threads = omp_get_max_threads();
+    const bool use_batch_quantization = 
+        (n >= max_threads * 2) &&  // Enough queries to benefit from parallelism
+        (nprobe_val <= 64);        // Not too many probes
+    
+    // Allocate memory for coarse quantization results
+    std::unique_ptr<idx_t[]> coarse_idx(new idx_t[n * nprobe_val]);
+    std::unique_ptr<float[]> coarse_dis(new float[n * nprobe_val]);
+    
+    IndexIVFStats local_stats;
+    local_stats.reset();
+    
+    double t0 = getmillisecs();
+    
+    if (use_batch_quantization) {
+        /*
+         * Strategy 1: Batch quantization + parallel IVF scan
+         * 
+         * Perform all HNSW quantization in a single batch call.
+         * This is optimal when:
+         * - We have many queries (n is large)
+         * - HNSW can leverage internal parallelism efficiently
+         * - The graph traversal can benefit from cache reuse
+         */
+        quantizer->search(
+                n,
+                x,
+                nprobe_val,
+                coarse_dis.get(),
+                coarse_idx.get(),
+                params ? params->quantizer_params : nullptr);
+        
+        double t1 = getmillisecs();
+        local_stats.quantization_time += t1 - t0;
+        
+        // Prefetch inverted lists
+        invlists->prefetch_lists(coarse_idx.get(), n * nprobe_val);
+        
+        // Parallel IVF list scanning
+        search_preassigned(
+                n,
+                x,
+                k,
+                coarse_idx.get(),
+                coarse_dis.get(),
+                distances,
+                labels,
+                false,
+                params,
+                &local_stats);
+                
+        double t2 = getmillisecs();
+        local_stats.search_time += t2 - t0;
+        
+    } else {
+        /*
+         * Strategy 2: Chunked parallel processing
+         * 
+         * Process queries in chunks, where each chunk performs:
+         * 1. HNSW quantization for the chunk
+         * 2. IVF list scanning for the chunk
+         * 
+         * This approach provides better cache locality for HNSW
+         * graph traversal when the number of queries is moderate.
+         */
+        
+        // Determine chunk size based on efSearch and available threads
+        // Larger efSearch means HNSW does more work per query, so use smaller chunks
+        const idx_t chunk_size = std::max<idx_t>(
+            1,
+            std::min<idx_t>(
+                n,
+                static_cast<idx_t>(max_threads * (128 / std::max(efSearch, 16)))
+            )
+        );
+        
+        std::mutex exception_mutex;
+        std::string exception_string;
+        std::vector<IndexIVFStats> thread_stats(max_threads);
+        
+        // Process in chunks with proper thread-local handling
+#pragma omp parallel
+        {
+            int thread_id = omp_get_thread_num();
+            thread_stats[thread_id].reset();
+            
+#pragma omp for schedule(dynamic, 1)
+            for (idx_t chunk_start = 0; chunk_start < n; chunk_start += chunk_size) {
+                idx_t chunk_end = std::min(chunk_start + chunk_size, n);
+                idx_t chunk_n = chunk_end - chunk_start;
+                
+                try {
+                    // Local timing
+                    double chunk_t0 = getmillisecs();
+                    
+                    // HNSW quantization for this chunk
+                    quantizer->search(
+                            chunk_n,
+                            x + chunk_start * d,
+                            nprobe_val,
+                            coarse_dis.get() + chunk_start * nprobe_val,
+                            coarse_idx.get() + chunk_start * nprobe_val,
+                            params ? params->quantizer_params : nullptr);
+                    
+                    double chunk_t1 = getmillisecs();
+                    thread_stats[thread_id].quantization_time += chunk_t1 - chunk_t0;
+                    
+                    // Prefetch lists for this chunk
+                    invlists->prefetch_lists(
+                            coarse_idx.get() + chunk_start * nprobe_val,
+                            chunk_n * nprobe_val);
+                    
+                    // IVF list scanning for this chunk
+                    search_preassigned(
+                            chunk_n,
+                            x + chunk_start * d,
+                            k,
+                            coarse_idx.get() + chunk_start * nprobe_val,
+                            coarse_dis.get() + chunk_start * nprobe_val,
+                            distances + chunk_start * k,
+                            labels + chunk_start * k,
+                            false,
+                            params,
+                            &thread_stats[thread_id]);
+                    
+                    double chunk_t2 = getmillisecs();
+                    thread_stats[thread_id].search_time += chunk_t2 - chunk_t0;
+                    
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lock(exception_mutex);
+                    exception_string = e.what();
+                }
+            }
+        }
+        
+        if (!exception_string.empty()) {
+            FAISS_THROW_MSG(exception_string.c_str());
+        }
+        
+        // Aggregate statistics from all threads
+        for (int t = 0; t < max_threads; t++) {
+            local_stats.add(thread_stats[t]);
+        }
+    }
+    
+    // Update global statistics
+    indexIVF_stats.add(local_stats);
 }
 
 

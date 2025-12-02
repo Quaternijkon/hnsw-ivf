@@ -252,3 +252,139 @@ TEST(IVF, list_context) {
                 << "should return the query vector";
     }
 }
+
+// Test for search_with_hnsw functionality
+#include <faiss/IndexHNSW.h>
+
+TEST(IVF, search_with_hnsw) {
+    // Test search_with_hnsw with HNSW quantizer
+    constexpr int d = 32;       // dimension
+    constexpr int nb = 10000;   // database size
+    constexpr int nlist = 100;  // number of clusters
+    constexpr int M = 16;       // HNSW parameter
+    constexpr int nq = 10;      // number of queries
+    constexpr int k = 10;       // number of nearest neighbors
+    constexpr int nprobe = 8;   // number of probes
+
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<> distrib;
+
+    // Create HNSW quantizer
+    faiss::IndexHNSWFlat hnsw_quantizer(d, M);
+    hnsw_quantizer.hnsw.efConstruction = 40;
+    hnsw_quantizer.hnsw.efSearch = 32;
+
+    // Create IVF index with HNSW quantizer
+    faiss::IndexIVFFlat index(&hnsw_quantizer, d, nlist);
+    index.own_fields = false;  // Don't own quantizer
+    
+    // Generate training data
+    constexpr size_t nt = 2000;
+    std::vector<float> trainvecs(nt * d);
+    for (size_t i = 0; i < nt * d; i++) {
+        trainvecs[i] = distrib(rng);
+    }
+    
+    // Train index
+    index.train(nt, trainvecs.data());
+    EXPECT_TRUE(index.is_trained);
+
+    // Generate database
+    std::vector<float> database(nb * d);
+    for (size_t i = 0; i < nb * d; i++) {
+        database[i] = distrib(rng);
+    }
+    
+    // Add vectors to index
+    index.add(nb, database.data());
+    EXPECT_EQ(index.ntotal, nb);
+
+    // Generate queries
+    std::vector<float> queries(nq * d);
+    for (size_t i = 0; i < nq * d; i++) {
+        queries[i] = distrib(rng);
+    }
+    
+    // Set nprobe
+    index.nprobe = nprobe;
+
+    // Search with search_with_hnsw
+    std::vector<float> distances_hnsw(nq * k);
+    std::vector<faiss::idx_t> labels_hnsw(nq * k);
+    index.search_with_hnsw(
+            nq, queries.data(), k, distances_hnsw.data(), labels_hnsw.data());
+
+    // Search with regular search for comparison
+    std::vector<float> distances_regular(nq * k);
+    std::vector<faiss::idx_t> labels_regular(nq * k);
+    index.search(
+            nq, queries.data(), k, distances_regular.data(), labels_regular.data());
+
+    // Compare results - they should be identical since we're using the same
+    // underlying search_preassigned function
+    for (int i = 0; i < nq; i++) {
+        for (int j = 0; j < k; j++) {
+            EXPECT_EQ(labels_hnsw[i * k + j], labels_regular[i * k + j])
+                    << "Labels mismatch at query " << i << " neighbor " << j;
+            EXPECT_NEAR(
+                    distances_hnsw[i * k + j],
+                    distances_regular[i * k + j],
+                    1e-5)
+                    << "Distances mismatch at query " << i << " neighbor " << j;
+        }
+    }
+}
+
+TEST(IVF, search_with_hnsw_fallback) {
+    // Test that search_with_hnsw falls back to regular search when quantizer
+    // is not HNSW
+    constexpr int d = 32;
+    constexpr int nb = 1000;
+    constexpr int nlist = 10;
+    constexpr int nq = 5;
+    constexpr int k = 5;
+
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<> distrib;
+
+    // Create flat quantizer (not HNSW)
+    faiss::IndexFlatL2 flat_quantizer(d);
+    faiss::IndexIVFFlat index(&flat_quantizer, d, nlist);
+    index.own_fields = false;
+
+    // Generate and train
+    std::vector<float> trainvecs(500 * d);
+    for (size_t i = 0; i < 500 * d; i++) {
+        trainvecs[i] = distrib(rng);
+    }
+    index.train(500, trainvecs.data());
+
+    // Generate and add database
+    std::vector<float> database(nb * d);
+    for (size_t i = 0; i < nb * d; i++) {
+        database[i] = distrib(rng);
+    }
+    index.add(nb, database.data());
+
+    // Generate queries
+    std::vector<float> queries(nq * d);
+    for (size_t i = 0; i < nq * d; i++) {
+        queries[i] = distrib(rng);
+    }
+
+    // Both search methods should return the same results
+    std::vector<float> distances_hnsw(nq * k);
+    std::vector<faiss::idx_t> labels_hnsw(nq * k);
+    index.search_with_hnsw(
+            nq, queries.data(), k, distances_hnsw.data(), labels_hnsw.data());
+
+    std::vector<float> distances_regular(nq * k);
+    std::vector<faiss::idx_t> labels_regular(nq * k);
+    index.search(
+            nq, queries.data(), k, distances_regular.data(), labels_regular.data());
+
+    for (int i = 0; i < nq * k; i++) {
+        EXPECT_EQ(labels_hnsw[i], labels_regular[i]);
+        EXPECT_NEAR(distances_hnsw[i], distances_regular[i], 1e-5);
+    }
+}
