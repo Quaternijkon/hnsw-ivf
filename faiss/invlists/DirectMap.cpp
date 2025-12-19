@@ -85,8 +85,9 @@ idx_t DirectMap::get(idx_t key) const {
 }
 
 void DirectMap::add_single_id(idx_t id, idx_t list_no, size_t offset) {
-    if (type == NoMap)
+    if (type == NoMap) {
         return;
+    }
 
     if (type == Array) {
         assert(id == array.size());
@@ -110,13 +111,14 @@ void DirectMap::check_can_add(const idx_t* ids) {
 
 /********************* DirectMapAdd implementation */
 
-DirectMapAdd::DirectMapAdd(DirectMap& direct_map, size_t n, const idx_t* xids)
+DirectMapAdd::DirectMapAdd(DirectMap& direct_map, size_t n, const idx_t* xids, size_t offset)
         : direct_map(direct_map), type(direct_map.type), n(n), xids(xids) {
     if (type == DirectMap::Array) {
         FAISS_THROW_IF_NOT(xids == nullptr);
         ntotal = direct_map.array.size();
         direct_map.array.resize(ntotal + n, -1);
     } else if (type == DirectMap::Hashtable) {
+        ntotal = offset;
         // can't parallel update hashtable so use temp array
         all_ofs.resize(n, -1);
     }

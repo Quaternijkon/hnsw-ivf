@@ -101,7 +101,7 @@ struct DirectMapAdd {
 
     std::vector<idx_t> all_ofs;
 
-    DirectMapAdd(DirectMap& direct_map, size_t n, const idx_t* xids);
+    DirectMapAdd(DirectMap& direct_map, size_t n, const idx_t* xids, size_t offset = 0);
 
     /// add vector i (with id xids[i]) at list_no and offset
     void add(size_t i, idx_t list_no, size_t offset);
